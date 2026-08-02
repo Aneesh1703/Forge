@@ -85,7 +85,7 @@ class ParserFactory:
         Language.RUBY: "ruby",
     }
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.cache: dict[Language, TreeSitterParser] = {}
 
     def get_parser(self, language: Language) -> TreeSitterParser:

@@ -19,6 +19,7 @@ Algorithm
 """
 
 from pathlib import Path
+from typing import Any
 
 from pathspec import PathSpec
 
@@ -67,7 +68,7 @@ class RepositoryWalker:
 
         return collection
 
-    def _load_gitignore(self, repository: Path) -> PathSpec:
+    def _load_gitignore(self, repository: Path) -> PathSpec[Any]:
         gitignore_path = repository / ".gitignore"
 
         if not gitignore_path.exists():

@@ -35,13 +35,13 @@ Algorithm
 4. Return the syntax tree.
 """
 
-from tree_sitter import Parser, Tree
+from tree_sitter import Language, Parser, Tree
 
 from app.repository.models import RepositoryFile
 
 
 class TreeSitterParser:
-    def __init__(self, grammar) -> None:
+    def __init__(self, grammar: Language) -> None:
         self.parser = Parser()
         self.parser.language = grammar
 
