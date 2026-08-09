@@ -87,11 +87,15 @@ class ParserFactory:
 
     def __init__(self) -> None:
         self.cache: dict[Language, TreeSitterParser] = {}
+        self.hits: int = 0
+        self.misses: int = 0
 
     def get_parser(self, language: Language) -> TreeSitterParser:
         if language in self.cache:
+            self.hits += 1
             return self.cache[language]
 
+        self.misses += 1
         grammar_name = self.LANGUAGE_MAP.get(language)
         if grammar_name is None:
             raise ValueError(f"Unsupported language: {language}")

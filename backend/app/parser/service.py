@@ -104,7 +104,7 @@ class ParserService:
         parser = self._parser_factory.get_parser(repository_file.language)
 
         # 2. Parse the file
-        tree = parser.parse(repository_file)
+        result = parser.parse(repository_file)
 
         # 3. Get the appropriate adapter for the language
         adapter = self._adapter_factory.get_adapter(repository_file.language)
@@ -113,11 +113,10 @@ class ParserService:
         extractor = SymbolExtractor(adapter)
 
         # 5. Extract symbols
-        source_code = repository_file.path.read_bytes()
         symbols = extractor.extract(
-            tree=tree,
+            tree=result.tree,
             repository_file=repository_file,
-            source=source_code,
+            source=result.source,
         )
 
         return symbols

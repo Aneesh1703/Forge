@@ -29,9 +29,18 @@ end_column"""
 
 from dataclasses import dataclass, field
 from enum import Enum
+from uuid import UUID, uuid4
+
+from tree_sitter import Tree
 
 from app.repository.language import Language
 from app.repository.models import RepositoryFile
+
+
+@dataclass(frozen=True)
+class ParseResult:
+    tree: Tree
+    source: bytes
 
 
 class SymbolKind(Enum):
@@ -77,4 +86,12 @@ class CodeSymbol:
     end_line: int
     start_column: int
     end_column: int
+    start_byte: int
+    end_byte: int
+
+    id: UUID = field(default_factory=uuid4)
+
+    signature: str | None = None
+    return_type: str | None = None
     parent: ParentSymbol | None = None
+    parent_symbol_id: UUID | None = None

@@ -90,6 +90,10 @@ class CodeSymbolORM(Base):
 
     end_column: Mapped[int] = mapped_column(Integer)
 
+    start_byte: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    end_byte: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

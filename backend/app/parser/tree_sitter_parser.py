@@ -1,50 +1,15 @@
-"""
-Import RepositoryFile
+from tree_sitter import Language, Parser
 
-Import Parser
-Import Language
-
-Create TreeSitterParser
-
---------------------------------
-
-Constructor
-
-Input
-
-Tree-sitter Language
-
-Store
-
-Parser
-
---------------------------------
-
-Method
-
-parse(repository_file)
-
-Algorithm
-
-1. Read the file contents.
-
-2. Encode text as UTF-8 bytes.
-
-3. Parse bytes using the parser.
-
-4. Return the syntax tree.
-"""
-
-from tree_sitter import Language, Parser, Tree
-
+from app.parser.models import ParseResult
 from app.repository.models import RepositoryFile
 
 
 class TreeSitterParser:
     def __init__(self, grammar: Language) -> None:
-        self.parser = Parser()
-        self.parser.language = grammar
+        self._grammar = grammar
 
-    def parse(self, repository_file: RepositoryFile) -> Tree:
-        source = repository_file.path.read_text(encoding="utf-8")
-        return self.parser.parse(source.encode("utf-8"))
+    def parse(self, repository_file: RepositoryFile) -> ParseResult:
+        source_bytes = repository_file.path.read_bytes()
+        parser = Parser(self._grammar)
+        tree = parser.parse(source_bytes)
+        return ParseResult(tree=tree, source=source_bytes)

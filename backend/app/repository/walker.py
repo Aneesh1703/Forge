@@ -18,13 +18,14 @@ Algorithm
 6. Return the collection.
 """
 
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from pathspec import PathSpec
 
 from app.repository.detector import LanguageDetector
-from app.repository.models import RepositoryFile
+from app.repository.models import Repository, RepositoryFile
 
 
 class RepositoryWalker:
@@ -37,32 +38,35 @@ class RepositoryWalker:
         "build",
     }
 
-    def walk(self, repository: Path) -> list[RepositoryFile]:
-        if not repository.exists():
-            raise FileNotFoundError(f"{repository} does not exist.")
+    def walk(self, repository: Repository) -> list[RepositoryFile]:
+        if not repository.root_path.exists():
+            raise FileNotFoundError(f"{repository.root_path} does not exist.")
 
-        if not repository.is_dir():
-            raise NotADirectoryError(f"{repository} is not a directory.")
+        if not repository.root_path.is_dir():
+            raise NotADirectoryError(f"{repository.root_path} is not a directory.")
 
-        spec = self._load_gitignore(repository)
+        spec = self._load_gitignore(repository.root_path)
 
         collection: list[RepositoryFile] = []
-        for path in repository.rglob("*"):
+        for path in repository.root_path.rglob("*"):
             if not path.is_file():
                 continue
             if any(part in self.IGNORED_DIRS for part in path.parts):
                 continue
-            rel_path = path.relative_to(repository)
+            rel_path = path.relative_to(repository.root_path)
             if spec.match_file(str(rel_path)):
                 continue
 
             collection.append(
                 RepositoryFile(
+                    repository_id=repository.id,
                     path=path,
                     relative_path=rel_path,
                     extension=path.suffix,
                     language=LanguageDetector.detect(path),
                     size=path.stat().st_size,
+                    content_hash="",
+                    last_modified=datetime.now(),
                 )
             )
 

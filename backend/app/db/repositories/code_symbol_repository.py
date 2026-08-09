@@ -1,9 +1,73 @@
 """
-bulk_insert_symbols()
-
-get_symbols()
-
-get_symbol()
-
-delete_symbols()
+Repository for persisting and querying code symbols.
 """
+
+from uuid import UUID
+
+from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.models import CodeSymbolORM
+from app.parser.models import CodeSymbol
+
+
+class CodeSymbolRepository:
+    def __init__(self, session: AsyncSession):
+        self._session = session
+
+    @staticmethod
+    def _to_orm(symbol: CodeSymbol) -> CodeSymbolORM:
+        return CodeSymbolORM(
+            id=symbol.id,
+            file_id=symbol.file.id,
+            parent_symbol_id=symbol.parent_symbol_id,
+            name=symbol.name,
+            kind=symbol.kind.value,
+            signature=symbol.signature,
+            return_type=symbol.return_type,
+            start_line=symbol.start_line,
+            end_line=symbol.end_line,
+            start_column=symbol.start_column,
+            end_column=symbol.end_column,
+            start_byte=symbol.start_byte,
+            end_byte=symbol.end_byte,
+        )
+
+    async def bulk_create(
+        self,
+        symbols: list[CodeSymbol],
+    ) -> None:
+        if not symbols:
+            return
+        orm_symbols = [self._to_orm(symbol) for symbol in symbols]
+        self._session.add_all(orm_symbols)
+        await self._session.flush()
+
+    async def get_by_file(
+        self,
+        file_id: UUID,
+    ) -> list[CodeSymbolORM]:
+        result = await self._session.scalars(
+            select(CodeSymbolORM)
+            .where(CodeSymbolORM.file_id == file_id)
+            .order_by(CodeSymbolORM.start_line)
+        )
+        return list(result)
+
+    async def delete_by_file(
+        self,
+        file_id: UUID,
+    ) -> None:
+        if not file_id:
+            return
+        await self._session.execute(delete(CodeSymbolORM).where(CodeSymbolORM.file_id == file_id))
+
+    async def delete_by_file_ids(
+        self,
+        file_ids: list[UUID],
+    ) -> None:
+        if not file_ids:
+            return
+        await self._session.execute(
+            delete(CodeSymbolORM).where(CodeSymbolORM.file_id.in_(file_ids))
+        )

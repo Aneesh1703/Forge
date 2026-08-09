@@ -175,10 +175,13 @@ SymbolMetadata
 CodeSymbol
 """
 
+from uuid import UUID
+
 from tree_sitter import Node, Tree
 
 from app.parser.adapters.base import BaseLanguageAdapter
 from app.parser.models import CodeSymbol
+from app.parser.position import BytePositionMapper
 from app.repository.models import RepositoryFile
 
 
@@ -199,34 +202,48 @@ class SymbolExtractor:
         """
         Extract symbol metadata from a Tree-sitter AST.
         """
+        mapper = BytePositionMapper(source)
         symbols: list[CodeSymbol] = []
-        root = tree.root_node
-        self._visit(root, repository_file, source, symbols)
-        return symbols
+        stack: list[Node] = [tree.root_node]
+        parent_stack: list[tuple[int, UUID]] = []
 
-    def _visit(
-        self,
-        node: Node,
-        repository_file: RepositoryFile,
-        source: bytes,
-        symbols: list[CodeSymbol],
-    ) -> None:
-        """
-        Recursive visitor for AST nodes.
-        """
-        metadata = self.adapter.extract_symbol(node, source)
-        if metadata is not None:
-            symbol = CodeSymbol(
-                name=metadata.name,
-                kind=metadata.kind,
-                language=repository_file.language,
-                file=repository_file,
-                start_line=node.start_point.row,
-                end_line=node.end_point.row,
-                start_column=node.start_point.column,
-                end_column=node.end_point.column,
-                parent=metadata.parent,
-            )
-            symbols.append(symbol)
-        for child in node.children:
-            self._visit(child, repository_file, source, symbols)
+        while stack:
+            node = stack.pop()
+
+            start_byte = node.start_byte
+            end_byte = node.end_byte
+
+            while parent_stack and start_byte >= parent_stack[-1][0]:
+                parent_stack.pop()
+
+            current_parent_id = parent_stack[-1][1] if parent_stack else None
+
+            metadata = self.adapter.extract_symbol(node, source)
+            if metadata is not None:
+                start_line, start_column = mapper.position(start_byte)
+                end_line, end_column = mapper.position(end_byte)
+
+                symbol = CodeSymbol(
+                    name=metadata.name,
+                    kind=metadata.kind,
+                    language=repository_file.language,
+                    file=repository_file,
+                    start_line=start_line,
+                    end_line=end_line,
+                    start_column=start_column,
+                    end_column=end_column,
+                    start_byte=start_byte,
+                    end_byte=end_byte,
+                    parent=metadata.parent,
+                    parent_symbol_id=current_parent_id,
+                )
+                symbols.append(symbol)
+                parent_stack.append((end_byte, symbol.id))
+
+            # Push children in reverse so leftmost child is processed first.
+            for i in range(node.child_count - 1, -1, -1):
+                child = node.child(i)
+                if child is not None:
+                    stack.append(child)
+
+        return symbols

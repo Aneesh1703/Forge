@@ -1,4 +1,5 @@
 from pathlib import Path
+from uuid import uuid4
 
 from app.parser.adapters.python import PythonAdapter
 from app.parser.extractor import SymbolExtractor
@@ -28,6 +29,7 @@ def hello():
     language_detector = LanguageDetector()
 
     repository_file = RepositoryFile(
+        repository_id=uuid4(),
         path=file_path,
         relative_path=Path("sample.py"),
         extension=".py",
@@ -36,14 +38,14 @@ def hello():
     )
 
     parser = ParserFactory().get_parser(repository_file.language)
-    tree = parser.parse(repository_file)
+    result = parser.parse(repository_file)
 
     extractor = SymbolExtractor(PythonAdapter())
 
     symbols = extractor.extract(
-        tree=tree,
+        tree=result.tree,
         repository_file=repository_file,
-        source=source.encode("utf-8"),
+        source=result.source,
     )
 
     print("\nExtracted Symbols:")
