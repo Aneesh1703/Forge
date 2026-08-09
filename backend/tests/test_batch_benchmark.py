@@ -36,7 +36,7 @@ class BatchResult:
 
 
 @pytest.mark.anyio
-async def test_benchmark_batch_sizes():
+async def test_benchmark_batch_sizes() -> None:
     test_repo_path = Path("d:/benchmarks/pydantic")
     if not test_repo_path.exists():
         pytest.skip(f"Test repo not found: {test_repo_path}")
