@@ -6,8 +6,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from sqlalchemy import select
 
 from app.db.database import engine, session_factory
+from app.db.models import CodeSymbolORM
 from app.db.models.base import Base
 from app.db.repositories import (
     CodeSymbolRepository,
@@ -46,6 +48,8 @@ class IndexResult:
     avg_batch_size: float
     total_time: float
     peak_memory_mb: float
+    symbols_with_params: int = 0
+    symbols_with_docs: int = 0
 
 
 async def _index_repo(repo_path: Path) -> IndexResult:
@@ -98,6 +102,16 @@ async def _index_repo(repo_path: Path) -> IndexResult:
 
         db_insert_time = time.perf_counter() - db_start
 
+        # Query back ORM symbols to verify rich metadata in DB
+        db_symbols = (
+            await session.scalars(
+                select(CodeSymbolORM).where(CodeSymbolORM.file_id.in_([f.id for f in files]))
+            )
+        ).all()
+
+        symbols_with_params = sum(1 for s in db_symbols if s.parameters)
+        symbols_with_docs = sum(1 for s in db_symbols if s.documentation)
+
     total_time = time.perf_counter() - total_start
 
     _, peak = tracemalloc.get_traced_memory()
@@ -141,6 +155,8 @@ async def _index_repo(repo_path: Path) -> IndexResult:
         avg_batch_size=avg_batch_size,
         total_time=total_time,
         peak_memory_mb=peak_mb,
+        symbols_with_params=symbols_with_params,
+        symbols_with_docs=symbols_with_docs,
     )
 
 
@@ -185,6 +201,8 @@ def _print_repo_report(r: IndexResult) -> None:
             print(f"  {label + ':':25s}{count:>8,}")
 
     print(f"  Total symbols:         {total_symbols:>8,}")
+    print(f"  DB symbols w/ params:  {r.symbols_with_params:>8,}")
+    print(f"  DB symbols w/ docs:    {r.symbols_with_docs:>8,}")
     print()
     print("--- Database Metrics ---")
     print(f"  Repo insert time:      {r.repo_insert_time:>8.4f} s")
@@ -295,3 +313,5 @@ async def test_benchmark_suite() -> None:
         assert r.files_discovered > 0, f"{r.name}: no files discovered"
         assert r.files_parsed > 0, f"{r.name}: no files parsed"
         assert len(r.symbols) > 0, f"{r.name}: no symbols extracted"
+        assert r.symbols_with_params > 0, f"{r.name}: no symbols with parameters in DB"
+        assert r.symbols_with_docs > 0, f"{r.name}: no symbols with documentation in DB"

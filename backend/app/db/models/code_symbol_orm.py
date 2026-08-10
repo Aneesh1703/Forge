@@ -1,37 +1,17 @@
 """
 CodeSymbolORM
 
-id
-
-file_id
-
-name
-
-kind
-
-signature
-
-return_type
-
-parent_symbol_id
-
-start_line
-
-end_line
-
-start_column
-
-end_column
+Represents a parsed code symbol stored in PostgreSQL.
 """
 
 from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
@@ -43,6 +23,8 @@ if TYPE_CHECKING:
 
 class CodeSymbolORM(Base):
     __tablename__ = "code_symbols"
+
+    # Identity
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -56,15 +38,14 @@ class CodeSymbolORM(Base):
         nullable=False,
     )
 
-    parent_symbol_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("code_symbols.id"),
-        nullable=True,
-    )
-
     name: Mapped[str] = mapped_column(
         String(255),
         nullable=False,
+    )
+
+    qualified_name: Mapped[str | None] = mapped_column(
+        String(512),
+        nullable=True,
     )
 
     kind: Mapped[str] = mapped_column(
@@ -72,27 +53,90 @@ class CodeSymbolORM(Base):
         nullable=False,
     )
 
-    signature: Mapped[str | None] = mapped_column(
-        Text,
+    # Hierarchy
+
+    parent_symbol_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("code_symbols.id"),
         nullable=True,
     )
+
+    # Location
+
+    start_line: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+
+    end_line: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+
+    start_column: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+
+    end_column: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+
+    start_byte: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+
+    end_byte: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+
+    # Semantic information
 
     return_type: Mapped[str | None] = mapped_column(
         String(255),
         nullable=True,
     )
 
-    start_line: Mapped[int] = mapped_column(Integer)
+    documentation: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
 
-    end_line: Mapped[int] = mapped_column(Integer)
+    visibility: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="unknown",
+    )
 
-    start_column: Mapped[int] = mapped_column(Integer)
+    parameters: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
 
-    end_column: Mapped[int] = mapped_column(Integer)
+    attributes: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
 
-    start_byte: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    modifiers: Mapped[list[str] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
 
-    end_byte: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    base_classes: Mapped[list[str] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
+
+    metadata_json: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
+
+    # Timestamps
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -104,6 +148,8 @@ class CodeSymbolORM(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
+
+    # Relationships
 
     file: Mapped["RepositoryFileORM"] = relationship(
         back_populates="symbols",

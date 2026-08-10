@@ -18,5 +18,9 @@ class BaseLanguageAdapter(ABC):
     ) -> SymbolMetadata | None:
         """
         Extract language-specific symbol metadata from a Tree-sitter node.
+
+        Returns:
+            SymbolMetadata when the node represents a supported symbol,
+            otherwise None.
         """
         pass

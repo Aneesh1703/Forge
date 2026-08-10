@@ -1,38 +1,13 @@
-"""
-Enum
-
-SymbolKind
-
---------------------------------
-
-Dataclass
-
-CodeSymbol
-
-Fields
-
-name
-
-kind (SymbolKind)
-
-language (Language)
-
-file (RepositoryFile)
-
-start_line
-
-end_line
-
-start_column
-
-end_column"""
-
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 from uuid import UUID, uuid4
 
 from tree_sitter import Tree
 
+from app.parser.modifiers import Modifier
+from app.parser.types import AttributeInfo, ParameterInfo
+from app.parser.visibility import Visibility
 from app.repository.language import Language
 from app.repository.models import RepositoryFile
 
@@ -43,7 +18,7 @@ class ParseResult:
     source: bytes
 
 
-class SymbolKind(Enum):
+class SymbolKind(str, Enum):
     UNKNOWN = "unknown"
     FUNCTION = "function"
     METHOD = "method"
@@ -64,24 +39,34 @@ class ParentSymbol:
 
 @dataclass
 class SymbolMetadata:
-    kind: SymbolKind
     name: str
+    kind: SymbolKind
     parent: ParentSymbol | None = None
 
-    decorators: list[str] = field(default_factory=list)
-    is_async: bool = False
-    docstring: str | None = None
-    parameters: list[str] = field(default_factory=list)
+    parameters: list[ParameterInfo] = field(default_factory=list)
     return_type: str | None = None
+    documentation: str | None = None
+
+    visibility: Visibility = Visibility.UNKNOWN
+
+    modifiers: set[Modifier] = field(default_factory=set)
+    attributes: list[AttributeInfo] = field(default_factory=list)
+
+    base_classes: list[str] = field(default_factory=list)
+
+    # Language-specific information only.
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class CodeSymbol:
+    # Identity
     name: str
     kind: SymbolKind
     language: Language
     file: RepositoryFile
 
+    # Location
     start_line: int
     end_line: int
     start_column: int
@@ -89,9 +74,25 @@ class CodeSymbol:
     start_byte: int
     end_byte: int
 
+    # Database identity
     id: UUID = field(default_factory=uuid4)
 
-    signature: str | None = None
-    return_type: str | None = None
+    # Hierarchy
+    qualified_name: str | None = None
     parent: ParentSymbol | None = None
     parent_symbol_id: UUID | None = None
+
+    # Semantic information
+    parameters: list[ParameterInfo] = field(default_factory=list)
+    return_type: str | None = None
+    documentation: str | None = None
+
+    visibility: Visibility = Visibility.UNKNOWN
+
+    modifiers: set[Modifier] = field(default_factory=set)
+    attributes: list[AttributeInfo] = field(default_factory=list)
+
+    base_classes: list[str] = field(default_factory=list)
+
+    # Language-specific information only.
+    metadata: dict[str, Any] = field(default_factory=dict)

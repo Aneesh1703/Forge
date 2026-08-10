@@ -22,9 +22,30 @@ class CodeSymbolRepository:
             file_id=symbol.file.id,
             parent_symbol_id=symbol.parent_symbol_id,
             name=symbol.name,
+            qualified_name=symbol.qualified_name,
             kind=symbol.kind.value,
-            signature=symbol.signature,
             return_type=symbol.return_type,
+            documentation=symbol.documentation,
+            visibility=symbol.visibility.value,
+            parameters=[
+                {
+                    "name": parameter.name,
+                    "kind": parameter.kind.value,
+                    "type_annotation": parameter.type_annotation,
+                    "default_value": parameter.default_value,
+                }
+                for parameter in symbol.parameters
+            ],
+            attributes=[
+                {
+                    "name": attribute.name,
+                    "arguments": attribute.arguments,
+                }
+                for attribute in symbol.attributes
+            ],
+            modifiers=[modifier.value for modifier in symbol.modifiers],
+            base_classes=symbol.base_classes,
+            metadata_json=symbol.metadata,
             start_line=symbol.start_line,
             end_line=symbol.end_line,
             start_column=symbol.start_column,
@@ -39,7 +60,9 @@ class CodeSymbolRepository:
     ) -> None:
         if not symbols:
             return
+
         orm_symbols = [self._to_orm(symbol) for symbol in symbols]
+
         self._session.add_all(orm_symbols)
         await self._session.flush()
 
@@ -60,6 +83,7 @@ class CodeSymbolRepository:
     ) -> None:
         if not file_id:
             return
+
         await self._session.execute(delete(CodeSymbolORM).where(CodeSymbolORM.file_id == file_id))
 
     async def delete_by_file_ids(
@@ -68,6 +92,7 @@ class CodeSymbolRepository:
     ) -> None:
         if not file_ids:
             return
+
         await self._session.execute(
             delete(CodeSymbolORM).where(CodeSymbolORM.file_id.in_(file_ids))
         )

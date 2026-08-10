@@ -236,6 +236,14 @@ class SymbolExtractor:
                     end_byte=end_byte,
                     parent=metadata.parent,
                     parent_symbol_id=current_parent_id,
+                    parameters=metadata.parameters,
+                    return_type=metadata.return_type,
+                    documentation=metadata.documentation,
+                    visibility=metadata.visibility,
+                    modifiers=metadata.modifiers,
+                    attributes=metadata.attributes,
+                    base_classes=metadata.base_classes,
+                    metadata=metadata.metadata,
                 )
                 symbols.append(symbol)
                 parent_stack.append((end_byte, symbol.id))
