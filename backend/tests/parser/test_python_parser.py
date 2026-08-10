@@ -3,7 +3,7 @@ from uuid import uuid4
 
 from app.parser.adapters.python import PythonAdapter
 from app.parser.extractor import SymbolExtractor
-from app.parser.models import SymbolKind
+from app.parser.models import CodeSymbol, SymbolKind
 from app.parser.modifiers import Modifier
 from app.parser.parser_factory import ParserFactory
 from app.parser.types import ParameterKind
@@ -12,7 +12,7 @@ from app.repository.detector import LanguageDetector
 from app.repository.models import RepositoryFile
 
 
-def _parse_and_extract(source: str, tmp_path: Path):
+def _parse_and_extract(source: str, tmp_path: Path) -> list[CodeSymbol]:
     file_path = tmp_path / "test_sample.py"
     file_path.write_text(source, encoding="utf-8")
 
