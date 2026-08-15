@@ -51,6 +51,12 @@ class RepositoryORM(Base):
         nullable=True,
     )
 
+    git_url_normalized: Mapped[str | None] = mapped_column(
+        String(1024),
+        unique=True,
+        nullable=True,
+    )
+
     default_branch: Mapped[str | None] = mapped_column(
         String(255),
         nullable=True,

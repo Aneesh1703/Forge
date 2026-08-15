@@ -14,6 +14,7 @@ class Repository:
     id: UUID = field(default_factory=uuid4)
 
     git_url: str | None = None
+    git_url_normalized: str | None = None
     default_branch: str | None = None
     indexed_at: datetime | None = None
 

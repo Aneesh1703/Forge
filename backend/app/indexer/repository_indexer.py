@@ -1,8 +1,10 @@
 import asyncio
 from datetime import datetime, timezone
+from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db.models import RepositoryFileORM
 from app.db.repositories import (
     CodeSymbolRepository,
     RepositoryFileRepository,
@@ -43,15 +45,99 @@ class RepositoryIndexer:
         if not root_path.exists():
             raise FileNotFoundError(f"Repository root path not found: {root_path}")
 
-        repo = self._build_repository(repository)
-        files = self._collect_repository_files(repo)
-        symbols = await self._parse_repository(files)
+        existing_repo = await self._repository_repo.get_existing(repository)
+        if existing_repo:
+            repo = Repository(
+                id=existing_repo.id,
+                name=repository.name or existing_repo.name,
+                root_path=repository.root_path,
+                git_url=repository.git_url or existing_repo.git_url,
+                git_url_normalized=existing_repo.git_url_normalized,
+                default_branch=repository.default_branch or existing_repo.default_branch,
+                indexed_at=existing_repo.indexed_at,
+            )
+        else:
+            repo = self._build_repository(repository)
 
-        async with self._session.begin():
+        discovered_files = self._collect_repository_files(repo)
+        existing_files = await self._file_repo.get_by_repository(repo.id)
+        db_files_map = {f.relative_path: f for f in existing_files}
+
+        files_to_parse, files_to_insert, stale_file_ids = self._diff_files(
+            discovered_files, db_files_map
+        )
+
+        symbols = await self._parse_repository(files_to_parse)
+
+        await self._persist_index(
+            existing_repo is not None,
+            repo,
+            stale_file_ids,
+            files_to_insert,
+            symbols,
+        )
+
+    async def _persist_index(
+        self,
+        repo_exists: bool,
+        repo: Repository,
+        stale_file_ids: list[UUID],
+        files_to_insert: list[RepositoryFile],
+        symbols: list[CodeSymbol],
+    ) -> None:
+        if not repo_exists:
             await self._store_repository(repo)
-            await self._store_files(files)
+
+        if stale_file_ids:
+            await self._symbol_repo.delete_by_file_ids(stale_file_ids)
+            await self._file_repo.delete_by_ids(stale_file_ids)
+
+        if files_to_insert:
+            await self._store_files(files_to_insert)
+
+        if symbols:
             await self._store_symbols(symbols)
-            await self._update_index_timestamp(repo)
+
+        await self._update_index_timestamp(repo)
+        await self._session.commit()
+
+    def _diff_files(
+        self,
+        discovered_files: list[RepositoryFile],
+        db_files_map: dict[str, RepositoryFileORM],
+    ) -> tuple[list[RepositoryFile], list[RepositoryFile], list[UUID]]:
+        files_to_parse: list[RepositoryFile] = []
+        files_to_insert: list[RepositoryFile] = []
+        stale_file_ids: list[UUID] = []
+        discovered_paths = set()
+
+        for disc_file in discovered_files:
+            rel_str = str(disc_file.relative_path)
+            discovered_paths.add(rel_str)
+            db_file = db_files_map.get(rel_str)
+
+            if db_file is None:
+                files_to_parse.append(disc_file)
+                files_to_insert.append(disc_file)
+            else:
+                is_changed = False
+                if disc_file.content_hash and db_file.hash:
+                    if disc_file.content_hash != db_file.hash:
+                        is_changed = True
+                elif disc_file.size != db_file.size:
+                    is_changed = True
+
+                if is_changed:
+                    disc_file.id = db_file.id
+                    stale_file_ids.append(db_file.id)
+                    files_to_parse.append(disc_file)
+                    files_to_insert.append(disc_file)
+
+        for rel_str, db_file in db_files_map.items():
+            if rel_str not in discovered_paths:
+                stale_file_ids.append(db_file.id)
+
+        return files_to_parse, files_to_insert, stale_file_ids
 
     def _build_repository(self, repository: Repository) -> Repository:
         """

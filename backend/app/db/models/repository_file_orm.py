@@ -50,6 +50,7 @@ class RepositoryFileORM(Base):
     repository_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("repositories.id"),
+        index=True,
         nullable=False,
     )
 

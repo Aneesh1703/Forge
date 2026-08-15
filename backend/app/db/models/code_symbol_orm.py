@@ -35,6 +35,7 @@ class CodeSymbolORM(Base):
     file_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("repository_files.id"),
+        index=True,
         nullable=False,
     )
 
@@ -58,6 +59,7 @@ class CodeSymbolORM(Base):
     parent_symbol_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("code_symbols.id"),
+        index=True,
         nullable=True,
     )
 
