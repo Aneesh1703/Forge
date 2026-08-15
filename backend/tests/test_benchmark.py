@@ -2,7 +2,7 @@ import math
 import time
 import tracemalloc
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -10,9 +10,10 @@ import pytest
 from sqlalchemy import select
 
 from app.db.database import engine, session_factory
-from app.db.models import CodeSymbolORM
+from app.db.models import CodeRelationshipORM, CodeSymbolORM
 from app.db.models.base import Base
 from app.db.repositories import (
+    CodeRelationshipRepository,
     CodeSymbolRepository,
     RepositoryFileRepository,
     RepositoryRepository,
@@ -20,6 +21,7 @@ from app.db.repositories import (
 from app.indexer.config import IndexerConfig
 from app.indexer.repository_indexer import RepositoryIndexer
 from app.parser.models import CodeSymbol, SymbolKind
+from app.relationships.models import RelationshipKind, ResolutionStatus
 from app.repository.models import Repository
 
 BENCHMARKS_DIR = Path("d:/benchmarks")
@@ -51,6 +53,11 @@ class IndexResult:
     peak_memory_mb: float
     symbols_with_params: int = 0
     symbols_with_docs: int = 0
+    total_relationships: int = 0
+    resolved_relationships: int = 0
+    external_relationships: int = 0
+    unresolved_relationships: int = 0
+    relationship_counts: Counter[RelationshipKind] = field(default_factory=Counter)
     warm_pass_time: float | None = None
 
 
@@ -74,12 +81,14 @@ async def _index_repo(
         repo_repo = RepositoryRepository(session)
         file_repo = RepositoryFileRepository(session)
         symbol_repo = CodeSymbolRepository(session)
+        relationship_repo = CodeRelationshipRepository(session)
 
         indexer = RepositoryIndexer(
             db_session=session,
             repository_repo=repo_repo,
             file_repo=file_repo,
             symbol_repo=symbol_repo,
+            relationship_repo=relationship_repo,
             config=config,
         )
 
@@ -91,9 +100,17 @@ async def _index_repo(
             orm_repo = await repo_repo.get_existing(repo)
             assert orm_repo is not None
             db_files = await file_repo.get_by_repository(orm_repo.id)
+            db_file_ids = [f.id for f in db_files]
+
             db_symbols = (
                 await session.scalars(
-                    select(CodeSymbolORM).where(CodeSymbolORM.file_id.in_([f.id for f in db_files]))
+                    select(CodeSymbolORM).where(CodeSymbolORM.file_id.in_(db_file_ids))
+                )
+            ).all()
+
+            db_relationships = (
+                await session.scalars(
+                    select(CodeRelationshipORM).where(CodeRelationshipORM.file_id.in_(db_file_ids))
                 )
             ).all()
 
@@ -102,6 +119,24 @@ async def _index_repo(
             skipped_count = 0
             symbols_with_params = sum(1 for s in db_symbols if s.parameters)
             symbols_with_docs = sum(1 for s in db_symbols if s.documentation)
+
+            total_rels = len(db_relationships)
+            resolved_rels = sum(
+                1 for r in db_relationships if r.status == ResolutionStatus.RESOLVED.value
+            )
+            external_rels = sum(
+                1 for r in db_relationships if r.status == ResolutionStatus.EXTERNAL.value
+            )
+            unresolved_rels = sum(
+                1 for r in db_relationships if r.status == ResolutionStatus.UNRESOLVED.value
+            )
+
+            rel_counts: Counter[RelationshipKind] = Counter()
+            for r in db_relationships:
+                try:
+                    rel_counts[RelationshipKind(r.kind)] += 1
+                except ValueError:
+                    pass
 
             t_repo = 0.001
             t_files = 0.01
@@ -125,7 +160,7 @@ async def _index_repo(
             files_discovered = len(files)
 
             parse_start = time.perf_counter()
-            symbols = await indexer._parse_repository(files)
+            symbols, raw_relationships = await indexer._parse_repository(files)
             parse_time = time.perf_counter() - parse_start
 
             db_start = time.perf_counter()
@@ -142,18 +177,49 @@ async def _index_repo(
                 await indexer._store_symbols(symbols)
                 t_symbols = time.perf_counter() - t0
 
+                if raw_relationships:
+                    await indexer._resolve_and_store_relationships(
+                        repo.id, symbols, raw_relationships
+                    )
+
                 await indexer._update_index_timestamp(repo)
 
             db_insert_time = time.perf_counter() - db_start
 
+            db_file_ids = [f.id for f in files]
             db_symbols = (
                 await session.scalars(
-                    select(CodeSymbolORM).where(CodeSymbolORM.file_id.in_([f.id for f in files]))
+                    select(CodeSymbolORM).where(CodeSymbolORM.file_id.in_(db_file_ids))
+                )
+            ).all()
+
+            db_relationships = (
+                await session.scalars(
+                    select(CodeRelationshipORM).where(CodeRelationshipORM.file_id.in_(db_file_ids))
                 )
             ).all()
 
             symbols_with_params = sum(1 for s in db_symbols if s.parameters)
             symbols_with_docs = sum(1 for s in db_symbols if s.documentation)
+
+            total_rels = len(db_relationships)
+            resolved_rels = sum(
+                1 for r in db_relationships if r.status == ResolutionStatus.RESOLVED.value
+            )
+            external_rels = sum(
+                1 for r in db_relationships if r.status == ResolutionStatus.EXTERNAL.value
+            )
+            unresolved_rels = sum(
+                1 for r in db_relationships if r.status == ResolutionStatus.UNRESOLVED.value
+            )
+
+            rel_counts = Counter()
+            for r in db_relationships:
+                try:
+                    rel_counts[RelationshipKind(r.kind)] += 1
+                except ValueError:
+                    pass
+
             parsed_files = [f for f in files if f.size <= config.max_file_size_bytes]
             skipped_count = len(files) - len(parsed_files)
             parsed_len = len(parsed_files)
@@ -170,8 +236,9 @@ async def _index_repo(
 
     file_batches = math.ceil(files_discovered / config.batch_size) if files_discovered else 0
     symbol_batches = math.ceil(len(dummy_symbols) / config.batch_size) if dummy_symbols else 0
-    batch_count = file_batches + symbol_batches
-    total_items = files_discovered + len(dummy_symbols)
+    rel_batches = math.ceil(total_rels / config.batch_size) if total_rels else 0
+    batch_count = file_batches + symbol_batches + rel_batches
+    total_items = files_discovered + len(dummy_symbols) + total_rels
     avg_batch_size = (total_items / batch_count) if batch_count > 0 else 0.0
 
     counts: Counter[SymbolKind] = Counter()
@@ -204,6 +271,11 @@ async def _index_repo(
         peak_memory_mb=peak_mb,
         symbols_with_params=symbols_with_params,
         symbols_with_docs=symbols_with_docs,
+        total_relationships=total_rels,
+        resolved_relationships=resolved_rels,
+        external_relationships=external_rels,
+        unresolved_relationships=unresolved_rels,
+        relationship_counts=rel_counts,
         warm_pass_time=warm_pass_time,
     )
 
@@ -252,6 +324,24 @@ def _print_repo_report(r: IndexResult) -> None:
     print(f"  DB symbols w/ params:  {r.symbols_with_params:>8,}")
     print(f"  DB symbols w/ docs:    {r.symbols_with_docs:>8,}")
     print()
+    print("--- Code Relationships Graph Breakdown ---")
+    kind_labels_rel = [
+        (RelationshipKind.INHERITS, "Inheritance (INHERITS)"),
+        (RelationshipKind.IMPORTS, "Imports (IMPORTS)"),
+        (RelationshipKind.CALLS, "Function Calls (CALLS)"),
+        (RelationshipKind.USES_TYPE, "Type Annotations (USES_TYPE)"),
+    ]
+
+    for rel_kind, label in kind_labels_rel:
+        count = r.relationship_counts.get(rel_kind, 0)
+        if count > 0:
+            print(f"  {label + ':':30s}{count:>8,}")
+
+    print(f"  Total Graph Edges:     {r.total_relationships:>8,}")
+    print(f"  Resolved Symbols:      {r.resolved_relationships:>8,}")
+    print(f"  External Symbols:      {r.external_relationships:>8,}")
+    print(f"  Unresolved Symbols:    {r.unresolved_relationships:>8,}")
+    print()
     print("--- Database Metrics ---")
     print(f"  Repo insert time:      {r.repo_insert_time:>8.4f} s")
     print(f"  File insert time:      {r.file_insert_time:>8.2f} s")
@@ -272,15 +362,17 @@ def _print_repo_report(r: IndexResult) -> None:
 
 def _print_comparison_table(results: list[IndexResult]) -> None:
     print()
-    print("=" * 115)
+    print("=" * 135)
     print("  COMPARISON SUMMARY TABLE")
-    print("=" * 115)
+    print("=" * 135)
     print()
 
     header = (
         f"  {'Repository':<12s}"
         f"{'Files':>7s}"
         f"{'Symbols':>9s}"
+        f"{'Edges':>9s}"
+        f"{'Resolved':>9s}"
         f"{'Parse(s)':>9s}"
         f"{'Parse(ms/f)':>12s}"
         f"{'DB(s)':>8s}"
@@ -290,7 +382,7 @@ def _print_comparison_table(results: list[IndexResult]) -> None:
         f"{'Mem(MB)':>9s}"
     )
     print(header)
-    print("  " + "-" * 111)
+    print("  " + "-" * 131)
 
     for r in results:
         total_symbols = len(r.symbols)
@@ -300,6 +392,8 @@ def _print_comparison_table(results: list[IndexResult]) -> None:
             f"  {r.name:<12s}"
             f"{r.files_parsed:>7,}"
             f"{total_symbols:>9,}"
+            f"{r.total_relationships:>9,}"
+            f"{r.resolved_relationships:>9,}"
             f"{r.parse_time:>9.2f}"
             f"{r.avg_parse_time_ms:>12.2f}"
             f"{r.db_insert_time:>8.2f}"
@@ -314,6 +408,8 @@ def _print_comparison_table(results: list[IndexResult]) -> None:
 
     total_files = sum(r.files_parsed for r in results)
     total_symbols = sum(len(r.symbols) for r in results)
+    total_edges = sum(r.total_relationships for r in results)
+    total_resolved = sum(r.resolved_relationships for r in results)
     total_time = sum(r.total_time for r in results)
     peak_mem = max(r.peak_memory_mb for r in results)
     total_parse_time = sum(r.parse_time for r in results)
@@ -325,6 +421,8 @@ def _print_comparison_table(results: list[IndexResult]) -> None:
         f"  {'TOTALS':<12s}"
         f"{total_files:>7,}"
         f"{total_symbols:>9,}"
+        f"{total_edges:>9,}"
+        f"{total_resolved:>9,}"
         f"{total_parse_time:>9.2f}"
         f"{avg_parse_ms_all:>12.2f}"
         f"{total_db_time:>8.2f}"
@@ -334,7 +432,7 @@ def _print_comparison_table(results: list[IndexResult]) -> None:
         f"{peak_mem:>9.2f}"
     )
     print()
-    print("=" * 115)
+    print("=" * 135)
     print()
 
 
@@ -380,3 +478,7 @@ async def test_benchmark_suite(request: pytest.FixtureRequest) -> None:
         assert len(r.symbols) > 0, f"{r.name}: no symbols extracted"
         assert r.symbols_with_params > 0, f"{r.name}: no symbols with parameters in DB"
         assert r.symbols_with_docs > 0, f"{r.name}: no symbols with documentation in DB"
+        assert r.total_relationships > 0, f"{r.name}: no code relationships extracted"
+        assert r.resolved_relationships + r.external_relationships > 0, (
+            f"{r.name}: no resolved or external relationships"
+        )

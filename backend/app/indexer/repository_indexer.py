@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import RepositoryFileORM
 from app.db.repositories import (
+    CodeRelationshipRepository,
     CodeSymbolRepository,
     RepositoryFileRepository,
     RepositoryRepository,
@@ -16,6 +17,7 @@ from app.parser.adapters.adapter_factory import AdapterFactory
 from app.parser.extractor import SymbolExtractor
 from app.parser.models import CodeSymbol
 from app.parser.parser_factory import ParserFactory
+from app.relationships import RawRelationship, SymbolResolver
 from app.repository.language import Language
 from app.repository.models import Repository, RepositoryFile
 from app.repository.walker import RepositoryWalker
@@ -28,12 +30,14 @@ class RepositoryIndexer:
         repository_repo: RepositoryRepository,
         file_repo: RepositoryFileRepository,
         symbol_repo: CodeSymbolRepository,
+        relationship_repo: CodeRelationshipRepository | None = None,
         config: IndexerConfig = IndexerConfig(),
     ) -> None:
         self._session = db_session
         self._repository_repo = repository_repo
         self._file_repo = file_repo
         self._symbol_repo = symbol_repo
+        self._relationship_repo = relationship_repo or CodeRelationshipRepository(db_session)
         self._config = config
         self._parser_factory = ParserFactory()
         self._adapter_factory = AdapterFactory()
@@ -67,7 +71,7 @@ class RepositoryIndexer:
             discovered_files, db_files_map
         )
 
-        symbols = await self._parse_repository(files_to_parse)
+        symbols, raw_relationships = await self._parse_repository(files_to_parse)
 
         await self._persist_index(
             existing_repo is not None,
@@ -75,6 +79,7 @@ class RepositoryIndexer:
             stale_file_ids,
             files_to_insert,
             symbols,
+            raw_relationships,
         )
 
     async def _persist_index(
@@ -84,11 +89,13 @@ class RepositoryIndexer:
         stale_file_ids: list[UUID],
         files_to_insert: list[RepositoryFile],
         symbols: list[CodeSymbol],
+        raw_relationships: list[RawRelationship],
     ) -> None:
         if not repo_exists:
             await self._store_repository(repo)
 
         if stale_file_ids:
+            await self._relationship_repo.delete_by_file_ids(stale_file_ids)
             await self._symbol_repo.delete_by_file_ids(stale_file_ids)
             await self._file_repo.delete_by_ids(stale_file_ids)
 
@@ -98,8 +105,50 @@ class RepositoryIndexer:
         if symbols:
             await self._store_symbols(symbols)
 
+        if raw_relationships:
+            await self._resolve_and_store_relationships(repo.id, symbols, raw_relationships)
+
         await self._update_index_timestamp(repo)
         await self._session.commit()
+
+    async def _resolve_and_store_relationships(
+        self,
+        repository_id: UUID,
+        symbols: list[CodeSymbol],
+        raw_relationships: list[RawRelationship],
+    ) -> None:
+        symbols_by_id = {s.id: s for s in symbols}
+        symbols_by_qualname = {s.qualified_name: s for s in symbols if s.qualified_name}
+        symbols_by_name: dict[str, list[CodeSymbol]] = {}
+        for s in symbols:
+            symbols_by_name.setdefault(s.name, []).append(s)
+
+        resolver = SymbolResolver()
+        raw_by_file: dict[UUID, list[RawRelationship]] = {}
+        for r in raw_relationships:
+            raw_by_file.setdefault(r.source_file_id, []).append(r)
+
+        file_symbols_map: dict[UUID, list[CodeSymbol]] = {}
+        for s in symbols:
+            file_symbols_map.setdefault(s.file.id, []).append(s)
+
+        all_resolved = []
+        for file_id, raw_list in raw_by_file.items():
+            f_syms = file_symbols_map.get(file_id, [])
+            resolved = resolver.resolve_relationships(
+                repository_id=repository_id,
+                file_id=file_id,
+                raw_relationships=raw_list,
+                symbols_by_id=symbols_by_id,
+                symbols_by_qualname=symbols_by_qualname,
+                symbols_by_name=symbols_by_name,
+                file_symbols=f_syms,
+            )
+            all_resolved.extend(resolved)
+
+        if all_resolved:
+            for batch in batch_items(all_resolved, self._config.batch_size):
+                await self._relationship_repo.bulk_create(batch)
 
     def _diff_files(
         self,
@@ -140,11 +189,6 @@ class RepositoryIndexer:
         return files_to_parse, files_to_insert, stale_file_ids
 
     def _build_repository(self, repository: Repository) -> Repository:
-        """
-        Responsibilities:
-        → Preserve existing repository attributes (id, git_url, default_branch)
-        → Return new Repository with populated name if empty
-        """
         if repository.name:
             return repository
 
@@ -158,22 +202,12 @@ class RepositoryIndexer:
         )
 
     def _collect_repository_files(self, repo: Repository) -> list[RepositoryFile]:
-        """
-        Responsibilities:
-        → Call RepositoryWalker
-        → Walk the repository
-        → Return all discovered files
-        """
         walker = RepositoryWalker()
         return walker.walk(repo)
 
-    def _parse_file(self, file: RepositoryFile) -> list[CodeSymbol]:
-        """
-        Parse a single file and extract code symbols synchronously.
-        Skips files exceeding the configured max file size or unknown languages.
-        """
+    def _parse_file(self, file: RepositoryFile) -> tuple[list[CodeSymbol], list[RawRelationship]]:
         if file.size > self._config.max_file_size_bytes or file.language == Language.UNKNOWN:
-            return []
+            return [], []
 
         try:
             parser = self._parser_factory.get_parser(file.language)
@@ -182,35 +216,37 @@ class RepositoryIndexer:
             result = parser.parse(file)
             extractor = SymbolExtractor(adapter)
 
-            return extractor.extract(
+            return extractor.extract_with_relationships(
                 tree=result.tree,
                 repository_file=file,
                 source=result.source,
             )
         except ValueError as exc:
             if "Unsupported language" in str(exc):
-                return []
+                return [], []
             raise
 
     async def _parse_repository(
         self,
         files: list[RepositoryFile],
-    ) -> list[CodeSymbol]:
-        """
-        Parse repository files in parallel using worker threads and extract code symbols.
-        """
+    ) -> tuple[list[CodeSymbol], list[RawRelationship]]:
         if not files:
-            return []
+            return [], []
 
         semaphore = asyncio.Semaphore(self._config.max_workers)
 
-        async def _parse_worker(file: RepositoryFile) -> list[CodeSymbol]:
+        async def _parse_worker(
+            file: RepositoryFile,
+        ) -> tuple[list[CodeSymbol], list[RawRelationship]]:
             async with semaphore:
                 return await asyncio.to_thread(self._parse_file, file)
 
-        symbol_batches = await asyncio.gather(*(_parse_worker(file) for file in files))
+        results = await asyncio.gather(*(_parse_worker(file) for file in files))
 
-        return [symbol for batch in symbol_batches for symbol in batch]
+        symbols = [s for sym_batch, _ in results for s in sym_batch]
+        raw_rels = [r for _, rel_batch in results for r in rel_batch]
+
+        return symbols, raw_rels
 
     async def _store_symbols(self, symbols: list[CodeSymbol]) -> None:
         if not symbols:

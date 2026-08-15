@@ -30,6 +30,7 @@ Algorithm
 9. Return SymbolMetadata."""
 
 from types import MappingProxyType
+from uuid import UUID
 
 from tree_sitter import Node
 
@@ -42,6 +43,7 @@ from app.parser.models import (
 from app.parser.modifiers import Modifier
 from app.parser.types import AttributeInfo, ParameterInfo, ParameterKind
 from app.parser.visibility import Visibility
+from app.relationships.models import RawRelationship, RelationshipKind
 
 
 class PythonAdapter(BaseLanguageAdapter):
@@ -541,3 +543,184 @@ class PythonAdapter(BaseLanguageAdapter):
                 parameters.append(param_info)
 
         return parameters
+
+    def extract_relationships(
+        self,
+        node: Node,
+        source: bytes,
+        file_id: UUID,
+        start_line: int = 1,
+        start_column: int = 0,
+        current_symbol: SymbolMetadata | None = None,
+        scope: str | None = None,
+        qualified_name: str | None = None,
+    ) -> list[RawRelationship]:
+        """
+        Extract raw relationships (INHERITS, IMPORTS, CALLS, USES_TYPE) from Python AST node.
+        """
+        relationships: list[RawRelationship] = []
+        source_line = start_line
+        source_column = start_column
+        symbol_name = current_symbol.name if current_symbol else None
+
+        if node.type == "class_definition":
+            base_classes = self._extract_base_classes(node, source)
+            for base in base_classes:
+                relationships.append(
+                    RawRelationship(
+                        source_file_id=file_id,
+                        target_name=base,
+                        kind=RelationshipKind.INHERITS,
+                        source_line=source_line,
+                        source_column=source_column,
+                        source_symbol_name=symbol_name,
+                        source_scope=scope,
+                        source_qualified_name=qualified_name,
+                    )
+                )
+
+        elif node.type in ("import_statement", "import_from_statement"):
+            rels = self._extract_import_relationships(
+                node,
+                source,
+                file_id,
+                source_line,
+                source_column,
+                symbol_name,
+                scope,
+                qualified_name,
+            )
+            relationships.extend(rels)
+
+        elif node.type == "call":
+            fn_node = node.child_by_field_name("function") or (
+                node.children[0] if node.children else None
+            )
+            if fn_node is not None:
+                fn_name = source[fn_node.start_byte : fn_node.end_byte].decode("utf-8").strip()
+                if fn_name:
+                    relationships.append(
+                        RawRelationship(
+                            source_file_id=file_id,
+                            target_name=fn_name,
+                            kind=RelationshipKind.CALLS,
+                            source_line=source_line,
+                            source_column=source_column,
+                            source_symbol_name=symbol_name,
+                            source_scope=scope,
+                            source_qualified_name=qualified_name,
+                        )
+                    )
+
+        elif node.type == "typed_parameter":
+            type_node = node.child_by_field_name("type")
+            if type_node is not None:
+                type_str = source[type_node.start_byte : type_node.end_byte].decode("utf-8").strip()
+                if type_str:
+                    relationships.append(
+                        RawRelationship(
+                            source_file_id=file_id,
+                            target_name=type_str,
+                            kind=RelationshipKind.USES_TYPE,
+                            source_line=source_line,
+                            source_column=source_column,
+                            source_symbol_name=symbol_name,
+                            source_scope=scope,
+                            source_qualified_name=qualified_name,
+                        )
+                    )
+
+        return relationships
+
+    def _extract_import_relationships(
+        self,
+        node: Node,
+        source: bytes,
+        file_id: UUID,
+        source_line: int,
+        source_column: int,
+        symbol_name: str | None,
+        scope: str | None,
+        qualified_name: str | None,
+    ) -> list[RawRelationship]:
+        results: list[RawRelationship] = []
+        if node.type == "import_statement":
+            for child in node.children:
+                if child.type in ("dotted_name", "aliased_import"):
+                    name_node = (
+                        child.child_by_field_name("name")
+                        if child.type == "aliased_import"
+                        else child
+                    )
+                    if name_node is not None:
+                        imp_name = (
+                            source[name_node.start_byte : name_node.end_byte]
+                            .decode("utf-8")
+                            .strip()
+                        )
+                        if imp_name:
+                            results.append(
+                                RawRelationship(
+                                    source_file_id=file_id,
+                                    target_name=imp_name,
+                                    kind=RelationshipKind.IMPORTS,
+                                    source_line=source_line,
+                                    source_column=source_column,
+                                    source_symbol_name=symbol_name,
+                                    source_scope=scope,
+                                    source_qualified_name=qualified_name,
+                                    target_module_hint=imp_name,
+                                )
+                            )
+        elif node.type == "import_from_statement":
+            module_node = node.child_by_field_name("module_name") or self._find_first_child_of_type(
+                node, "dotted_name"
+            )
+            module_hint = (
+                source[module_node.start_byte : module_node.end_byte].decode("utf-8").strip()
+                if module_node is not None
+                else None
+            )
+
+            for child in node.children:
+                if child.type in (
+                    "import_prefix",
+                    "from",
+                    "import",
+                    "dotted_name",
+                    ",",
+                    "(",
+                    ")",
+                    "whitespace",
+                ):
+                    if child == module_node:
+                        continue
+                    continue
+                if child.type in ("aliased_import", "dotted_name", "identifier"):
+                    name_node = (
+                        child.child_by_field_name("name")
+                        if child.type == "aliased_import"
+                        else child
+                    )
+                    if name_node is not None:
+                        imp_name = (
+                            source[name_node.start_byte : name_node.end_byte]
+                            .decode("utf-8")
+                            .strip()
+                        )
+                        if imp_name and imp_name != module_hint:
+                            results.append(
+                                RawRelationship(
+                                    source_file_id=file_id,
+                                    target_name=imp_name,
+                                    kind=RelationshipKind.IMPORTS,
+                                    source_line=source_line,
+                                    source_column=source_column,
+                                    source_symbol_name=symbol_name,
+                                    source_scope=scope,
+                                    source_qualified_name=qualified_name,
+                                    target_module_hint=module_hint,
+                                )
+                            )
+
+        return results

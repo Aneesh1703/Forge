@@ -14,6 +14,7 @@ import pytest
 from app.db.database import engine, session_factory
 from app.db.models.base import Base
 from app.db.repositories import (
+    CodeRelationshipRepository,
     CodeSymbolRepository,
     RepositoryFileRepository,
     RepositoryRepository,
@@ -60,18 +61,20 @@ async def test_benchmark_batch_sizes() -> None:
             repo_repo = RepositoryRepository(session)
             file_repo = RepositoryFileRepository(session)
             symbol_repo = CodeSymbolRepository(session)
+            relationship_repo = CodeRelationshipRepository(session)
 
             indexer = RepositoryIndexer(
                 db_session=session,
                 repository_repo=repo_repo,
                 file_repo=file_repo,
                 symbol_repo=symbol_repo,
+                relationship_repo=relationship_repo,
                 config=config,
             )
 
             repo = indexer._build_repository(Repository(name="Pydantic", root_path=test_repo_path))
             files = indexer._collect_repository_files(repo)
-            symbols = await indexer._parse_repository(files)
+            symbols, _ = await indexer._parse_repository(files)
 
             # Measure DB insertion times
             t_db_start = time.perf_counter()

@@ -182,12 +182,13 @@ from tree_sitter import Node, Tree
 from app.parser.adapters.base import BaseLanguageAdapter
 from app.parser.models import CodeSymbol
 from app.parser.position import BytePositionMapper
+from app.relationships.models import RawRelationship
 from app.repository.models import RepositoryFile
 
 
 class SymbolExtractor:
     """
-    Extract symbols from a Tree-sitter AST using a language adapter.
+    Extract symbols and raw relationships from a Tree-sitter AST using a language adapter.
     """
 
     def __init__(self, adapter: BaseLanguageAdapter) -> None:
@@ -202,10 +203,25 @@ class SymbolExtractor:
         """
         Extract symbol metadata from a Tree-sitter AST.
         """
+        symbols, _ = self.extract_with_relationships(tree, repository_file, source)
+        return symbols
+
+    def extract_with_relationships(
+        self,
+        tree: Tree,
+        repository_file: RepositoryFile,
+        source: bytes,
+    ) -> tuple[list[CodeSymbol], list[RawRelationship]]:
+        """
+        Extract symbols and raw relationships from a Tree-sitter AST.
+        """
         mapper = BytePositionMapper(source)
         symbols: list[CodeSymbol] = []
+        raw_relationships: list[RawRelationship] = []
         stack: list[Node] = [tree.root_node]
-        parent_stack: list[tuple[int, UUID]] = []
+        parent_stack: list[
+            tuple[int, UUID, str, str | None]
+        ] = []  # end_byte, symbol_id, name, qual_name
 
         while stack:
             node = stack.pop()
@@ -217,10 +233,13 @@ class SymbolExtractor:
                 parent_stack.pop()
 
             current_parent_id = parent_stack[-1][1] if parent_stack else None
+            current_symbol_name = parent_stack[-1][2] if parent_stack else None
+            current_qual_name = parent_stack[-1][3] if parent_stack else None
 
             metadata = self.adapter.extract_symbol(node, source)
+            start_line, start_column = mapper.position(start_byte)
+
             if metadata is not None:
-                start_line, start_column = mapper.position(start_byte)
                 end_line, end_column = mapper.position(end_byte)
 
                 symbol = CodeSymbol(
@@ -246,7 +265,20 @@ class SymbolExtractor:
                     metadata=metadata.metadata,
                 )
                 symbols.append(symbol)
-                parent_stack.append((end_byte, symbol.id))
+                parent_stack.append((end_byte, symbol.id, symbol.name, symbol.qualified_name))
+
+            extracted_rels = self.adapter.extract_relationships(
+                node=node,
+                source=source,
+                file_id=repository_file.id,
+                start_line=start_line,
+                start_column=start_column,
+                current_symbol=metadata,
+                scope=current_symbol_name,
+                qualified_name=current_qual_name,
+            )
+            if extracted_rels:
+                raw_relationships.extend(extracted_rels)
 
             # Push children in reverse so leftmost child is processed first.
             for i in range(node.child_count - 1, -1, -1):
@@ -254,4 +286,4 @@ class SymbolExtractor:
                 if child is not None:
                     stack.append(child)
 
-        return symbols
+        return symbols, raw_relationships

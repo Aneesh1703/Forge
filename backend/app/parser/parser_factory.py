@@ -64,6 +64,8 @@ Algorithm
 7. Return parser.
 """
 
+from typing import Any
+
 from tree_sitter_language_pack import get_language
 
 from app.parser.tree_sitter_parser import TreeSitterParser
@@ -86,21 +88,21 @@ class ParserFactory:
     }
 
     def __init__(self) -> None:
-        self.cache: dict[Language, TreeSitterParser] = {}
+        self.grammar_cache: dict[Language, Any] = {}
         self.hits: int = 0
         self.misses: int = 0
 
     def get_parser(self, language: Language) -> TreeSitterParser:
-        if language in self.cache:
+        if language in self.grammar_cache:
             self.hits += 1
-            return self.cache[language]
+            grammar = self.grammar_cache[language]
+        else:
+            self.misses += 1
+            grammar_name = self.LANGUAGE_MAP.get(language)
+            if grammar_name is None:
+                raise ValueError(f"Unsupported language: {language}")
 
-        self.misses += 1
-        grammar_name = self.LANGUAGE_MAP.get(language)
-        if grammar_name is None:
-            raise ValueError(f"Unsupported language: {language}")
+            grammar = get_language(grammar_name)
+            self.grammar_cache[language] = grammar
 
-        grammar = get_language(grammar_name)
-        parser = TreeSitterParser(grammar)
-        self.cache[language] = parser
-        return parser
+        return TreeSitterParser(grammar)
