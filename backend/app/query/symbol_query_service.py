@@ -6,7 +6,7 @@ Executes rich structured queries against PostgreSQL for symbol discovery and loo
 
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import inspect, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -34,7 +34,10 @@ class SymbolQueryService:
         repo_id = UUID("00000000-0000-0000-0000-000000000000")
         lang = Language.PYTHON
 
-        target_file = file_orm or (orm.file if hasattr(orm, "file") and orm.file else None)
+        insp = inspect(orm)
+        target_file = file_orm or (
+            orm.file if "file" not in insp.unloaded and hasattr(orm, "file") and orm.file else None
+        )
         if target_file:
             file_path = target_file.relative_path
             repo_id = target_file.repository_id
@@ -97,7 +100,7 @@ class SymbolQueryService:
 
         parent_kind = None
         parent_name = None
-        if hasattr(orm, "parent") and orm.parent:
+        if "parent" not in insp.unloaded and hasattr(orm, "parent") and orm.parent:
             try:
                 parent_kind = SymbolKind(orm.parent.kind)
             except ValueError:

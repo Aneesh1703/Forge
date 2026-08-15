@@ -13,6 +13,7 @@ from app.db.repositories import (
 )
 from app.indexer.batching import batch_items
 from app.indexer.config import IndexerConfig
+from app.indexer.vector_indexer import IncrementalVectorIndexer
 from app.parser.adapters.adapter_factory import AdapterFactory
 from app.parser.extractor import SymbolExtractor
 from app.parser.models import CodeSymbol
@@ -32,6 +33,7 @@ class RepositoryIndexer:
         symbol_repo: CodeSymbolRepository,
         relationship_repo: CodeRelationshipRepository | None = None,
         config: IndexerConfig = IndexerConfig(),
+        vector_indexer: IncrementalVectorIndexer | None = None,
     ) -> None:
         self._session = db_session
         self._repository_repo = repository_repo
@@ -39,6 +41,7 @@ class RepositoryIndexer:
         self._symbol_repo = symbol_repo
         self._relationship_repo = relationship_repo or CodeRelationshipRepository(db_session)
         self._config = config
+        self._vector_indexer = vector_indexer
         self._parser_factory = ParserFactory()
         self._adapter_factory = AdapterFactory()
 
@@ -80,6 +83,7 @@ class RepositoryIndexer:
             files_to_insert,
             symbols,
             raw_relationships,
+            files_to_parse,
         )
 
     async def _persist_index(
@@ -90,6 +94,7 @@ class RepositoryIndexer:
         files_to_insert: list[RepositoryFile],
         symbols: list[CodeSymbol],
         raw_relationships: list[RawRelationship],
+        parsed_files: list[RepositoryFile] | None = None,
     ) -> None:
         if not repo_exists:
             await self._store_repository(repo)
@@ -107,6 +112,14 @@ class RepositoryIndexer:
 
         if raw_relationships:
             await self._resolve_and_store_relationships(repo.id, symbols, raw_relationships)
+
+        if self._vector_indexer is not None:
+            await self._vector_indexer.sync_incremental(
+                repository_id=repo.id,
+                stale_file_ids=stale_file_ids,
+                parsed_files=parsed_files or [],
+                symbols=symbols,
+            )
 
         await self._update_index_timestamp(repo)
         await self._session.commit()

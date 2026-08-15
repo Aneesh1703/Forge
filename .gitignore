@@ -30,3 +30,6 @@ htmlcov/
 
 # Windows
 Thumbs.db
+
+tests/
+docs/

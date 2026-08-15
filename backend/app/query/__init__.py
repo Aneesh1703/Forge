@@ -1,7 +1,5 @@
 """
-app.query Package
-
-Unified Query Engine and Context Layer for Forge.
+Forge Query Engine Package
 """
 
 from app.query.context_builder import RepositoryContextBuilder
@@ -20,16 +18,16 @@ from app.query.repository_query_service import RepositoryQueryService
 from app.query.symbol_query_service import SymbolQueryService
 
 __all__ = [
-    "SymbolQueryFilter",
-    "SymbolResult",
-    "RelationshipEdgeResult",
+    "GraphQueryService",
     "GraphTraversalResult",
     "ImpactAnalysisResult",
-    "RepositoryStatisticsResult",
-    "RepositoryContext",
-    "SymbolQueryService",
-    "GraphQueryService",
     "ImpactQueryService",
-    "RepositoryQueryService",
+    "RelationshipEdgeResult",
+    "RepositoryContext",
     "RepositoryContextBuilder",
+    "RepositoryQueryService",
+    "RepositoryStatisticsResult",
+    "SymbolQueryFilter",
+    "SymbolQueryService",
+    "SymbolResult",
 ]
