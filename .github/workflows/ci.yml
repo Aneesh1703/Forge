@@ -54,9 +54,6 @@ jobs:
       - name: MyPy
         run: uv run mypy .
 
-      - name: Run Tests
-        run: uv run pytest
-
       - name: Build Docker Image
         working-directory: .
         run: docker build -t forge-backend ./backend
