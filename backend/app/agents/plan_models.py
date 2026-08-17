@@ -59,6 +59,11 @@ class ImplementationPlan:
     confidence_score: float = 0.0
     tokens_used: int = 0
 
+    @property
+    def allowed_files(self) -> set[str]:
+        """Set of target file paths authorized for change in this plan."""
+        return {fa.file_path for fa in self.file_actions}
+
     @classmethod
     def create(
         cls,

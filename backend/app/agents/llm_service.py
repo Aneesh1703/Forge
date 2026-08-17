@@ -47,3 +47,51 @@ class MockLLMService:
             "verification_commands": ["uv run pytest tests/ -s"],
         }
         return json.dumps(mock_payload)
+
+
+class DeepSeekLLMService:
+    """Live DeepSeek LLM Provider for real agent code generation."""
+
+    def __init__(self, api_key: str | None = None, model: str = "deepseek-chat") -> None:
+        import os
+
+        from dotenv import load_dotenv
+
+        load_dotenv()
+        self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY", "")
+        self.model = model
+        self.base_url = "https://api.deepseek.com/chat/completions"
+
+    async def generate_completion(self, prompt: str, system_prompt: str = "") -> str:
+        import asyncio
+        import json
+        import urllib.request
+
+        if not self.api_key:
+            raise ValueError("DEEPSEEK_API_KEY is not set.")
+
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.2,
+        }
+
+        def _make_req() -> str:
+            req = urllib.request.Request(
+                self.base_url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req) as resp:
+                res_data = json.loads(resp.read().decode("utf-8"))
+                return str(res_data["choices"][0]["message"]["content"])
+
+        return await asyncio.to_thread(_make_req)
