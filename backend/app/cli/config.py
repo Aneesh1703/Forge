@@ -77,6 +77,13 @@ class ConfigManager:
         if p in keys:
             return str(keys[p])
 
+        # 3. Fallback to environment variables (e.g. DEEPSEEK_API_KEY, GEMINI_API_KEY)
+        import os
+
+        env_val = os.getenv(f"{p.upper()}_API_KEY") or os.getenv(p.upper())
+        if env_val:
+            return env_val
+
         return None
 
     @classmethod

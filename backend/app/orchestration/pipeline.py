@@ -74,7 +74,12 @@ class ForgeOrchestrator:
 
     @staticmethod
     def _create_llm_service() -> "LLMService | None":
-        """Creates LLM provider service (Gemini, OpenAI, Anthropic, or DeepSeek) from config/env."""
+        import os
+
+        from dotenv import load_dotenv
+
+        load_dotenv()
+
         from app.agents.llm_service import (
             AnthropicLLMService,
             DeepSeekLLMService,
@@ -82,20 +87,31 @@ class ForgeOrchestrator:
             OpenAILLMService,
         )
 
-        gemini_key = ConfigManager.get_key("gemini") or ConfigManager.get_key("google")
-        if gemini_key and not gemini_key.startswith("sk-mock"):
+        def _resolve_key(provider: str, env_name: str) -> str | None:
+            key = ConfigManager.get_key(provider)
+            if key and not key.startswith("sk-mock"):
+                return key
+            env_key = os.getenv(env_name)
+            if env_key and not env_key.startswith("sk-mock"):
+                return env_key
+            return key  # return mock key if no real env key found
+
+        gemini_key = _resolve_key("gemini", "GEMINI_API_KEY") or _resolve_key(
+            "google", "GOOGLE_API_KEY"
+        )
+        if gemini_key:
             return GeminiLLMService(api_key=gemini_key)
 
-        openai_key = ConfigManager.get_key("openai")
-        if openai_key and not openai_key.startswith("sk-mock"):
+        openai_key = _resolve_key("openai", "OPENAI_API_KEY")
+        if openai_key:
             return OpenAILLMService(api_key=openai_key)
 
-        anthropic_key = ConfigManager.get_key("anthropic")
-        if anthropic_key and not anthropic_key.startswith("sk-mock"):
+        anthropic_key = _resolve_key("anthropic", "ANTHROPIC_API_KEY")
+        if anthropic_key:
             return AnthropicLLMService(api_key=anthropic_key)
 
-        deepseek_key = ConfigManager.get_key("deepseek")
-        if deepseek_key and not deepseek_key.startswith("sk-mock"):
+        deepseek_key = _resolve_key("deepseek", "DEEPSEEK_API_KEY")
+        if deepseek_key:
             return DeepSeekLLMService(api_key=deepseek_key)
 
         return None

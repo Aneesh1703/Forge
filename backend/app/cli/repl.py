@@ -136,7 +136,7 @@ class ForgeREPL:
 
         panel = Panel(
             banner,
-            title="[bold white]Forge Engine v0.0.0[/bold white]",
+            title="[bold white]Forge Engine v0.0.1[/bold white]",
             subtitle="[dim]Autonomous Software Engineering Agent[/dim]",
             border_style="bright_cyan",
             box=box.DOUBLE,
