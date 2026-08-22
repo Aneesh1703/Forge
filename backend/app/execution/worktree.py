@@ -22,8 +22,26 @@ class GitWorktreeManager:
         self.repo_root = Path(repo_root).resolve()
         self.base_worktree_dir = self.repo_root / ".forge_worktrees"
 
+    def _ensure_git_exclude(self) -> None:
+        """Ensures .forge_worktrees & .forge_jobs are in .git/info/exclude."""
+        git_info_dir = self.repo_root / ".git" / "info"
+        if git_info_dir.exists():
+            exclude_file = git_info_dir / "exclude"
+            content = (
+                exclude_file.read_text(encoding="utf-8", errors="replace")
+                if exclude_file.exists()
+                else ""
+            )
+            needed = [".forge_worktrees/", ".forge_jobs/"]
+            to_add = [item for item in needed if item not in content]
+            if to_add:
+                git_info_dir.mkdir(parents=True, exist_ok=True)
+                with open(exclude_file, "a", encoding="utf-8") as f:
+                    f.write("\n" + "\n".join(to_add) + "\n")
+
     def create_worktree(self, job_id: str | uuid.UUID, base_branch: str = "main") -> Path:
         """Creates an isolated git worktree on branch forge/issue-<job_id>."""
+        self._ensure_git_exclude()
         str_job_id = str(job_id)
         branch_name = f"forge/job-{str_job_id}"
         worktree_path = self.base_worktree_dir / str_job_id
@@ -47,7 +65,8 @@ class GitWorktreeManager:
                 cmd,
                 cwd=str(self.repo_root),
                 capture_output=True,
-                text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
             )
             if result.returncode != 0:
@@ -56,7 +75,8 @@ class GitWorktreeManager:
                     cmd_existing,
                     cwd=str(self.repo_root),
                     capture_output=True,
-                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     check=False,
                 )
                 if res2.returncode != 0:

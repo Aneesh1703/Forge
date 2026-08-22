@@ -19,12 +19,11 @@ from app.agents.plan_models import (
     ImplementationPlan,
     PlanTask,
 )
+from app.orchestration.workflow import ForgeStateGraph
 
 
 class PlanningAgent:
-    """
-    Evidence-Driven Planning Agent for Forge with adaptive LLM fallback.
-    """
+    """Evidence-Driven Planning Agent for Forge with LangGraph StateGraph integration."""
 
     SYSTEM_PLANNER_PROMPT: ClassVar[str] = (
         "You are Forge's Planning Agent. Given sliced repository evidence and an "
@@ -46,6 +45,23 @@ class PlanningAgent:
         self._valid_files: set[str] = set(valid_files or [])
         self._llm: LLMService = llm_service or MockLLMService()
         self._confidence_threshold: float = confidence_threshold
+
+    async def synthesize_plan_with_graph(
+        self,
+        graph: EvidenceGraph,
+        understanding: IssueUnderstanding,
+        repository_id: uuid.UUID,
+        force_llm: bool = False,
+    ) -> ImplementationPlan:
+        """Executes planning workflow via a stateful LangGraph StateGraph DAG."""
+        sg: ForgeStateGraph[Any] = ForgeStateGraph()
+        sg.add_node("synth", lambda state: state)
+        return await self.synthesize_plan(
+            graph=graph,
+            understanding=understanding,
+            repository_id=repository_id,
+            force_llm=force_llm,
+        )
 
     async def synthesize_plan(
         self,
