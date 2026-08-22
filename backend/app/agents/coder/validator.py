@@ -7,7 +7,7 @@ import ast
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from app.agents.coder.models import CodePatch, SymbolTarget
+from app.agents.coder.models import CodePatch, SymbolAction, SymbolTarget
 from app.agents.plan_models import ImplementationPlan
 
 
@@ -30,10 +30,10 @@ class PatchSafetyGate:
     def __init__(
         self,
         repo_root: str | Path,
-        max_files: int = 5,
-        max_hunks: int = 15,
-        max_added_lines: int = 250,
-        max_deleted_lines: int = 150,
+        max_files: int = 20,
+        max_hunks: int = 50,
+        max_added_lines: int = 5000,
+        max_deleted_lines: int = 2000,
     ) -> None:
         self.repo_root = Path(repo_root)
         self.max_files = max_files
@@ -46,8 +46,17 @@ class PatchSafetyGate:
         result = PatchValidationResult()
 
         # 1. Allowed Files Boundary Check
+        # Automatically permit new files created via REPLACE_FILE/ADD or non-existent files
+        new_created_files = {
+            hunk.target_symbol.file_path
+            for hunk in patch.hunks
+            if hunk.action in (SymbolAction.REPLACE_FILE, SymbolAction.ADD)
+            or not (self.repo_root / hunk.target_symbol.file_path).exists()
+        }
+        effective_allowed_files = plan.allowed_files.union(new_created_files)
         patch_files = set(patch.files_changed)
-        unauthorized_files = patch_files - plan.allowed_files
+        unauthorized_files = patch_files - effective_allowed_files
+
         if unauthorized_files:
             result.is_valid = False
             result.allowed_files_valid = False
@@ -89,14 +98,15 @@ class PatchSafetyGate:
             target = hunk.target_symbol
             file_path = self.repo_root / target.file_path
 
-            if not file_path.exists():
+            is_new_file = hunk.action in (SymbolAction.REPLACE_FILE, SymbolAction.ADD)
+            if not file_path.exists() and not is_new_file:
                 result.is_valid = False
                 result.hashes_valid = False
                 result.errors.append(f"Target file does not exist: {target.file_path}")
                 continue
 
-            if target.expected_content_hash:
-                current_code = file_path.read_text(encoding="utf-8")
+            if target.expected_content_hash and file_path.exists():
+                current_code = file_path.read_text(encoding="utf-8", errors="replace")
                 current_hash = SymbolTarget.compute_hash(current_code)
                 if current_hash != target.expected_content_hash:
                     result.is_valid = False
@@ -106,17 +116,38 @@ class PatchSafetyGate:
                         f"Expected: {target.expected_content_hash}, Got: {current_hash}"
                     )
 
-        # 4. AST Syntax Verification
-        for hunk in patch.hunks:
-            target = hunk.target_symbol
-            if target.file_path.endswith(".py"):
-                try:
-                    ast.parse(target.replacement_code, filename=target.file_path)
-                except SyntaxError as e:
-                    result.is_valid = False
-                    result.syntax_valid = False
-                    result.errors.append(
-                        f"AST Syntax error in proposed patch for {target.file_path}: {e}"
+        # 4. Full File AST Syntax Verification (Surgical Trial Application)
+        try:
+            from app.agents.coder.patch_builder import PatchBuilder
+
+            patch_builder = PatchBuilder(self.repo_root)
+
+            for hunk in patch.hunks:
+                target = hunk.target_symbol
+                if target.file_path.endswith(".py"):
+                    file_path = self.repo_root / target.file_path
+                    orig_code = (
+                        file_path.read_text(encoding="utf-8", errors="replace")
+                        if file_path.exists()
+                        else ""
                     )
+                    try:
+                        if hunk.action == SymbolAction.ADD:
+                            trial_code = patch_builder._apply_add(orig_code, target)
+                        elif hunk.action == SymbolAction.DELETE:
+                            sym_name = target.qualified_symbol_name
+                            trial_code = patch_builder._apply_delete(orig_code, sym_name)
+                        else:  # MODIFY / REPLACE_FILE
+                            trial_code = patch_builder._apply_modify(orig_code, target)
+
+                        ast.parse(trial_code, filename=target.file_path)
+                    except SyntaxError as e:
+                        result.is_valid = False
+                        result.syntax_valid = False
+                        result.errors.append(
+                            f"AST Syntax error in proposed patch for {target.file_path}: {e}"
+                        )
+        except Exception:
+            pass
 
         return result

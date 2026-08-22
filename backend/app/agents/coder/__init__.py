@@ -12,6 +12,7 @@ from app.agents.coder.models import (
     ComplexityScore,
     ExecutionPolicy,
     ModelTier,
+    SymbolAction,
     SymbolTarget,
 )
 from app.agents.coder.patch_builder import PatchApplicationError, PatchBuilder
@@ -41,6 +42,7 @@ __all__ = [
     "RepairState",
     "ReviewDecision",
     "ReviewResult",
+    "SymbolAction",
     "SymbolTarget",
     "TracebackFrame",
     "TracebackParser",

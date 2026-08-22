@@ -83,9 +83,8 @@ class AutoFixLoop:
                 # 2. Node: Safety Gate Check
                 safety_res = self.safety_gate.validate(plan, patch)
                 if not safety_res.is_valid:
-                    state.summary = (
-                        f"Attempt {attempt}: Safety gate rejected patch - {safety_res.errors}"
-                    )
+                    errs = safety_res.errors
+                    state.summary = f"Attempt {attempt}: Safety gate rejected patch - {errs}"
                     continue
 
                 # 3. Node: Apply Patch to Worktree

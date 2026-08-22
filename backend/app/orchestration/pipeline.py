@@ -10,7 +10,7 @@ import logging
 import uuid
 from dataclasses import asdict
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from app.agents.llm_service import LLMService
@@ -74,14 +74,41 @@ class ForgeOrchestrator:
 
     @staticmethod
     def _create_llm_service() -> "LLMService | None":
-        """Creates a DeepSeek LLM service if API key is available."""
-        from app.agents.llm_service import DeepSeekLLMService, LLMService  # noqa: F811
+        """Creates LLM provider service (Gemini, OpenAI, Anthropic, or DeepSeek) from config/env."""
+        from app.agents.llm_service import (
+            AnthropicLLMService,
+            DeepSeekLLMService,
+            GeminiLLMService,
+            OpenAILLMService,
+        )
 
-        key = ConfigManager.get_key("deepseek")
-        if key and not key.startswith("sk-mock"):
-            svc: LLMService = DeepSeekLLMService(api_key=key)
-            return svc
+        gemini_key = ConfigManager.get_key("gemini") or ConfigManager.get_key("google")
+        if gemini_key and not gemini_key.startswith("sk-mock"):
+            return GeminiLLMService(api_key=gemini_key)
+
+        openai_key = ConfigManager.get_key("openai")
+        if openai_key and not openai_key.startswith("sk-mock"):
+            return OpenAILLMService(api_key=openai_key)
+
+        anthropic_key = ConfigManager.get_key("anthropic")
+        if anthropic_key and not anthropic_key.startswith("sk-mock"):
+            return AnthropicLLMService(api_key=anthropic_key)
+
+        deepseek_key = ConfigManager.get_key("deepseek")
+        if deepseek_key and not deepseek_key.startswith("sk-mock"):
+            return DeepSeekLLMService(api_key=deepseek_key)
+
         return None
+
+    def _sync_tokens(self, state: JobState) -> None:
+        """Syncs total prompt and completion tokens from LLM service to JobState."""
+        if hasattr(self, "coding_agent") and self.coding_agent and self.coding_agent.llm_service:
+            svc = self.coding_agent.llm_service
+            p_tok = getattr(svc, "total_prompt_tokens", 0)
+            c_tok = getattr(svc, "total_completion_tokens", 0)
+            if p_tok > 0 or c_tok > 0:
+                state.prompt_tokens = p_tok
+                state.completion_tokens = c_tok
 
     def get_state_path(self, job_id: str) -> Path:
         """Returns the file path for a given job's state file."""
@@ -166,6 +193,7 @@ class ForgeOrchestrator:
                 attempt_number=1,
             )
             state.code_patch = asdict(patch)
+            self._sync_tokens(state)
             state.save(state_path)
 
             # ==============================================================
@@ -189,6 +217,7 @@ class ForgeOrchestrator:
                     error_feedback=error_feedback,
                 )
                 state.code_patch = asdict(patch)
+                self._sync_tokens(state)
                 state.save(state_path)
                 safety_res = self.safety_gate.validate(plan, patch)
 
@@ -250,6 +279,11 @@ class ForgeOrchestrator:
                     state.save(state_path)
                     return state
 
+            if self.coding_agent.llm_service:
+                svc = self.coding_agent.llm_service
+                state.prompt_tokens = getattr(svc, "total_prompt_tokens", 0)
+                state.completion_tokens = getattr(svc, "total_completion_tokens", 0)
+
             state.status = JobStatus.COMPLETED
             try:
                 self.patch_builder.apply_patch(final_patch, verify_hash=False)
@@ -257,6 +291,11 @@ class ForgeOrchestrator:
                     self._publish_job_pr(state=state, plan=plan, patch=final_patch)
             except Exception as apply_err:
                 logger.warning(f"Could not apply patch or publish PR: {apply_err}")
+
+            if self.coding_agent.llm_service:
+                svc = self.coding_agent.llm_service
+                state.prompt_tokens = getattr(svc, "total_prompt_tokens", 0)
+                state.completion_tokens = getattr(svc, "total_completion_tokens", 0)
 
             state.save(state_path)
             return state
@@ -277,13 +316,13 @@ class ForgeOrchestrator:
         """Creates feature branch, commits patch, pushes to remote,
         and publishes GitHub PR if authenticated."""
         try:
-            # 1. Apply patch to repository files and create feature branch
+            # 1. Create feature branch first, then apply patch and commit
+            branch_name = self.git_service.create_feature_branch(state.job_id)
             try:
                 self.patch_builder.apply_patch(patch, verify_hash=False)
             except Exception as patch_err:
                 logger.warning(f"Patch apply warning in _publish_job_pr: {patch_err}")
 
-            branch_name = self.git_service.create_feature_branch(state.job_id)
             commit_sha = self.git_service.commit_patch(plan, patch)
             state.git_branch = branch_name
             state.commit_sha = commit_sha
@@ -294,7 +333,10 @@ class ForgeOrchestrator:
                 return None
 
             # 3. Push to remote
-            self.git_service.push_to_remote(branch_name)
+            pushed = self.git_service.push_to_remote(branch_name)
+            if not pushed:
+                logger.error(f"Failed to push {branch_name} to remote. Skipping PR.")
+                return None
 
             # 4. Generate PR body & publish via REST API
             owner, repo = self.git_service.get_remote_owner_repo()
@@ -412,9 +454,12 @@ class ForgeOrchestrator:
 
     @staticmethod
     def _reconstruct_patch(
-        patch_dict: dict[str, list[str] | list[dict[str, str]]],
+        patch_dict: dict[str, Any],
     ) -> CodePatch:
         """Reconstructs a CodePatch object from a serialized dict."""
-        files = patch_dict.get("files_changed", [])
-        files_list = [str(f) for f in files] if isinstance(files, list) else []
-        return CodePatch(files_changed=files_list, hunks=[])
+        try:
+            return CodePatch.from_dict(patch_dict)
+        except Exception:
+            files = patch_dict.get("files_changed", [])
+            files_list = [str(f) for f in files] if isinstance(files, list) else []
+            return CodePatch(files_changed=files_list, hunks=[])

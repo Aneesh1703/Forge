@@ -69,8 +69,12 @@ class GitHubAuthManager:
     """Helper service for verifying GitHub auth status and onboarding guidance."""
 
     @classmethod
+    def get_token(cls) -> str | None:
+        return CompositeGitHubAuth().get_token()
+
+    @classmethod
     def is_authenticated(cls) -> bool:
-        return CompositeGitHubAuth().get_token() is not None
+        return cls.get_token() is not None
 
     @classmethod
     def is_gh_cli_installed(cls) -> bool:

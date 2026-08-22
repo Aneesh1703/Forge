@@ -6,11 +6,12 @@ Owns LLM inference for multi-file code repair with unified context.
 import logging
 import textwrap
 from pathlib import Path
+from typing import Any
 
 from app.agents.candidate.models import CandidateContext
 from app.agents.coder.complexity import ComplexityScorer
 from app.agents.coder.context import MinimalContextBuilder, MultiFileContextBuilder
-from app.agents.coder.models import CodeHunk, CodePatch, SymbolTarget
+from app.agents.coder.models import CodeHunk, CodePatch, SymbolAction, SymbolTarget
 from app.agents.coder.prompts import CODER_SYSTEM_PROMPT
 from app.agents.llm_service import LLMService
 from app.agents.plan_models import ImplementationPlan
@@ -32,7 +33,38 @@ class CodingAgent:
         repo_root: str | Path,
         llm_service: LLMService | None = None,
     ) -> None:
+        import os
+
         self.repo_root = Path(repo_root)
+
+        if llm_service is None:
+            from app.agents.llm_service import (
+                AnthropicLLMService,
+                DeepSeekLLMService,
+                GeminiLLMService,
+                OpenAILLMService,
+            )
+            from app.cli.config import ConfigManager
+
+            gemini_key = (
+                ConfigManager.get_key("gemini")
+                or ConfigManager.get_key("google")
+                or os.getenv("GEMINI_API_KEY")
+                or os.getenv("GOOGLE_API_KEY")
+            )
+            openai_key = ConfigManager.get_key("openai") or os.getenv("OPENAI_API_KEY")
+            anthropic_key = ConfigManager.get_key("anthropic") or os.getenv("ANTHROPIC_API_KEY")
+            deepseek_key = ConfigManager.get_key("deepseek") or os.getenv("DEEPSEEK_API_KEY")
+
+            if gemini_key and not gemini_key.startswith("sk-mock"):
+                llm_service = GeminiLLMService(api_key=gemini_key)
+            elif openai_key and not openai_key.startswith("sk-mock"):
+                llm_service = OpenAILLMService(api_key=openai_key)
+            elif anthropic_key and not anthropic_key.startswith("sk-mock"):
+                llm_service = AnthropicLLMService(api_key=anthropic_key)
+            elif deepseek_key and not deepseek_key.startswith("sk-mock"):
+                llm_service = DeepSeekLLMService(api_key=deepseek_key)
+
         self.llm_service = llm_service
         self.context_builder = MinimalContextBuilder(self.repo_root)
         self.multifile_context_builder = MultiFileContextBuilder(self.repo_root)
@@ -60,7 +92,7 @@ class CodingAgent:
         if symbol_replacements:
             for target in symbol_replacements:
                 if target.file_path in plan.allowed_files:
-                    hunk = CodeHunk(target_symbol=target)
+                    hunk = CodeHunk(target_symbol=target, action=SymbolAction.MODIFY)
                     patch.hunks.append(hunk)
 
         return patch
@@ -112,13 +144,15 @@ class CodingAgent:
             "INSTRUCTIONS:\n"
             "1. Analyze the issue and the candidate file snippets above.\n"
             "2. Identify ONLY the files that actually need code changes.\n"
-            "3. For each file that needs a fix, output a section like:\n"
+            "3. For each hunk that needs a fix, output a section like:\n"
             "   ### FILE: <relative/path/to/file.py>\n"
+            "   ### ACTION: MODIFY | ADD | DELETE | REPLACE_FILE\n"
+            "   ### SYMBOL: <target_function_or_class_name>\n"
             "   ```python\n"
             "   <replacement code snippet>\n"
             "   ```\n"
-            "4. Output ONLY the changed function/class bodies (under 50 lines each).\n"
-            "5. Do NOT output files that do not need changes.\n"
+            "4. NEVER output the entire file contents unless using REPLACE_FILE.\n"
+            "5. For MODIFY or ADD, output ONLY the specific function/class definition.\n"
             "6. Do NOT wrap code in def fix_...() monkey-patch wrappers.\n"
             "7. Code must start at column 0 with no leading indentation.\n"
             f"(Attempt #{attempt_number})"
@@ -133,9 +167,9 @@ class CodingAgent:
             raise ValueError("Empty LLM response during multi-file patch generation.")
 
         # 4. Parse response into per-file targets
-        file_patches = self._parse_multifile_response(raw_response)
+        parsed_hunks = self._parse_multifile_response(raw_response)
 
-        all_files = list(file_patches.keys())
+        all_files = list({h["file_path"] for h in parsed_hunks})
         patch = CodePatch(
             files_changed=sorted(all_files),
             explanation=(
@@ -145,14 +179,21 @@ class CodingAgent:
             confidence=0.90,
         )
 
-        for file_path, code in file_patches.items():
+        for item in parsed_hunks:
             target = SymbolTarget(
-                file_path=file_path,
-                qualified_symbol_name="auto_detected",
+                file_path=str(item["file_path"]),
+                qualified_symbol_name=str(item["symbol_name"]),
                 expected_content_hash="",
-                replacement_code=code,
+                replacement_code=str(item["code"]),
+                original_snippet=str(item.get("original_snippet", "")),
+                anchor_symbol=str(item.get("anchor_symbol", "")),
+                anchor_position=str(item.get("anchor_position", "after")),
             )
-            patch.hunks.append(CodeHunk(target_symbol=target))
+            act_val = (
+                item["action"] if isinstance(item["action"], SymbolAction) else SymbolAction.MODIFY
+            )
+            hunk = CodeHunk(target_symbol=target, action=act_val)
+            patch.hunks.append(hunk)
 
         return patch
 
@@ -161,9 +202,9 @@ class CodingAgent:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _parse_multifile_response(raw: str) -> dict[str, str]:
-        """Parses LLM response with ### FILE: markers into a dict of {path: code}."""
-        result: dict[str, str] = {}
+    def _parse_multifile_response(raw: str) -> list[dict[str, Any]]:
+        """Parses LLM response with ### FILE:, ### ACTION:, ### SYMBOL: markers."""
+        result: list[dict[str, Any]] = []
         sections = raw.split("### FILE:")
 
         for section in sections[1:]:  # skip preamble before first marker
@@ -175,26 +216,72 @@ class CodingAgent:
             if not file_path:
                 continue
 
-            # Extract code between ``` fences
+            action = SymbolAction.MODIFY
+            symbol_name = "auto_detected"
+            anchor_symbol = ""
+            anchor_position = "after"
             code_lines: list[str] = []
-            in_fence = False
+            snippet_lines: list[str] = []
+            in_code_fence = False
+            in_snippet_fence = False
+
             for line in lines[1:]:
                 stripped = line.strip()
-                if stripped.startswith("```") and not in_fence:
-                    in_fence = True
+                if stripped.startswith("### ACTION:"):
+                    raw_act = stripped.replace("### ACTION:", "").strip().upper()
+                    try:
+                        action = SymbolAction(raw_act)
+                    except ValueError:
+                        pass
                     continue
-                if stripped.startswith("```") and in_fence:
-                    in_fence = False
+                if stripped.startswith("### SYMBOL:"):
+                    symbol_name = stripped.replace("### SYMBOL:", "").strip()
                     continue
-                if in_fence:
+                if stripped.startswith("### ANCHOR_SYMBOL:"):
+                    anchor_symbol = stripped.replace("### ANCHOR_SYMBOL:", "").strip()
+                    continue
+                if stripped.startswith("### ANCHOR_POSITION:"):
+                    anchor_position = stripped.replace("### ANCHOR_POSITION:", "").strip().lower()
+                    continue
+                if stripped.startswith("### ORIGINAL_SNIPPET:"):
+                    in_snippet_fence = True
+                    continue
+
+                if stripped.startswith("```") and not in_code_fence and not in_snippet_fence:
+                    in_code_fence = True
+                    continue
+                if stripped.startswith("```") and in_code_fence:
+                    in_code_fence = False
+                    continue
+
+                if in_snippet_fence:
+                    if stripped.startswith("```") and snippet_lines:
+                        in_snippet_fence = False
+                    else:
+                        if not stripped.startswith("```"):
+                            snippet_lines.append(line)
+                    continue
+
+                if in_code_fence:
                     code_lines.append(line)
 
-            # If no fences found, take all non-empty lines after the path
-            if not code_lines:
-                code_lines = [ln for ln in lines[1:] if ln.strip()]
+            if not code_lines and action != SymbolAction.DELETE:
+                code_lines = [
+                    ln for ln in lines[1:] if not ln.strip().startswith("###") and ln.strip()
+                ]
 
             code = textwrap.dedent("\n".join(code_lines)).strip()
-            if code:
-                result[file_path] = code
+            orig_snip = textwrap.dedent("\n".join(snippet_lines)).strip()
+            result.append(
+                {
+                    "file_path": file_path,
+                    "action": action,
+                    "symbol_name": symbol_name,
+                    "anchor_symbol": anchor_symbol,
+                    "anchor_position": anchor_position,
+                    "original_snippet": orig_snip,
+                    "code": code,
+                }
+            )
 
         return result

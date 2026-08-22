@@ -40,16 +40,11 @@ class GitService:
         """Creates and checks out a new git feature branch 'forge/issue-<job_id>'."""
         branch_name = f"forge/issue-{job_id[:8]}"
         try:
-            branches = self._run_git(["branch", "--list", branch_name])
-            if branch_name in branches:
-                self._run_git(["checkout", branch_name])
-            else:
-                self._run_git(["checkout", "-b", branch_name])
-        except Exception:
-            try:
-                self._run_git(["checkout", branch_name])
-            except Exception:
-                pass
+            self._run_git(["checkout", "-B", branch_name])
+            logger.info(f"Created/reset feature branch: {branch_name}")
+        except Exception as e:
+            logger.warning(f"Branch checkout warning for {branch_name}: {e}")
+
         return branch_name
 
     def format_conventional_commit(
@@ -96,6 +91,16 @@ class GitService:
             except Exception:
                 pass
 
+    def get_working_tree_diff(self) -> str:
+        """Returns physical 'git diff' string for current working tree / staged changes."""
+        try:
+            diff = self._run_git(["diff", "HEAD"])
+            if not diff.strip():
+                diff = self._run_git(["diff"])
+            return diff
+        except Exception:
+            return ""
+
     def commit_patch(
         self,
         plan: ImplementationPlan,
@@ -139,12 +144,28 @@ class GitService:
             return "NO_COMMIT"
 
     def push_to_remote(self, branch_name: str, remote_name: str = "origin") -> bool:
-        """Pushes the feature branch to origin remote repository."""
+        """Pushes the feature branch to origin remote repository using auth token if available."""
+        try:
+            from app.github.auth import GitHubAuthManager
+
+            token = GitHubAuthManager.get_token()
+            owner, repo = self.get_remote_owner_repo()
+
+            if token and owner != "local":
+                auth_url = f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
+                try:
+                    self._run_git(["push", "-u", auth_url, f"{branch_name}:{branch_name}"])
+                    return True
+                except Exception as auth_err:
+                    logger.warning(f"Token-authenticated push warning: {auth_err}")
+        except Exception:
+            pass
+
         try:
             self._run_git(["push", "-u", remote_name, branch_name])
             return True
-        except RuntimeError:
-            logger.warning(f"Failed to push {branch_name} to remote {remote_name}")
+        except RuntimeError as e:
+            logger.warning(f"Failed to push {branch_name} to remote {remote_name}: {e}")
             return False
 
     def get_remote_owner_repo(self) -> tuple[str, str]:

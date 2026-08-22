@@ -65,6 +65,10 @@ class JobState:
     pr_url: str | None = None
     error_message: str | None = None
 
+    # Token Usage & Metrics
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
     # Timestamps
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())

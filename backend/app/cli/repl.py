@@ -420,6 +420,12 @@ class ForgeREPL:
         )
         gate_str = "✅ PASS" if state.repo_gate_passed else "❌ FAIL"
 
+        in_tok = getattr(state, "prompt_tokens", 0)
+        out_tok = getattr(state, "completion_tokens", 0)
+        tot_tok = in_tok + out_tok
+        est_cost = (in_tok * 0.00000014) + (out_tok * 0.00000028)
+        tok_str = f"{tot_tok:,} ({in_tok:,} in / {out_tok:,} out) ~ ${est_cost:.4f}"
+
         console.print(
             Panel(
                 f"[bold]Job ID:[/bold]    {state.job_id}\n"
@@ -427,7 +433,8 @@ class ForgeREPL:
                 f"[bold]Issue:[/bold]     {state.issue_prompt[:80]}\n"
                 f"[bold]Policy:[/bold]    {state.execution_policy.value}\n"
                 f"[bold]Repairs:[/bold]   {state.repair_attempts}\n"
-                f"[bold]Gate:[/bold]      {gate_str}",
+                f"[bold]Gate:[/bold]      {gate_str}\n"
+                f"[bold]Tokens:[/bold]    {tok_str}",
                 title="📊 [bold cyan]Current Job Status[/bold cyan]",
                 border_style="cyan",
                 box=box.ROUNDED,
@@ -491,12 +498,19 @@ class ForgeREPL:
 
         if result.pr_url:
             commit_str = result.commit_sha[:8] if result.commit_sha else "N/A"
+            in_tok = getattr(result, "prompt_tokens", 0)
+            out_tok = getattr(result, "completion_tokens", 0)
+            tot_tok = in_tok + out_tok
+            est_cost = (in_tok * 0.00000014) + (out_tok * 0.00000028)
+            tok_str = f"{tot_tok:,} ({in_tok:,} in / {out_tok:,} out) ~ ${est_cost:.4f}"
+
             console.print(
                 Panel(
                     f"🎉 [bold success]Pull Request Published Successfully![/bold success]\n\n"
                     f"🔗 [bold cyan]PR URL:[/bold cyan] {result.pr_url}\n"
                     f"🌿 [bold white]Branch:[/bold white] {result.git_branch}\n"
-                    f"📝 [bold white]Commit:[/bold white] {commit_str}",
+                    f"📝 [bold white]Commit:[/bold white] {commit_str}\n"
+                    f"📊 [bold white]Tokens:[/bold white] {tok_str}",
                     title="🚀 [bold green]GitHub PR Published[/bold green]",
                     border_style="green",
                     box=box.ROUNDED,
@@ -540,6 +554,23 @@ class ForgeREPL:
             console.print("[warning]⚠️ No patch generated yet for this job.[/warning]\n")
             return
 
+        # 1. Attempt to render physical git diff from working tree as source of truth
+        if self.orchestrator and hasattr(self.orchestrator, "git_service"):
+            git_diff = self.orchestrator.git_service.get_working_tree_diff()
+            if git_diff and git_diff.strip():
+                syntax = Syntax(git_diff, "diff", theme="monokai", line_numbers=True)
+                console.print(
+                    Panel(
+                        syntax,
+                        title="🔍 [bold green]Physical Git Diff (Source of Truth)[/bold green]",
+                        border_style="green",
+                        box=box.ROUNDED,
+                    )
+                )
+                console.print()
+                return
+
+        # 2. Fallback to per-hunk action breakdown
         patch = state.code_patch
         files = patch.get("files_changed", [])
         hunks = patch.get("hunks", [])
@@ -549,18 +580,20 @@ class ForgeREPL:
             Panel(
                 f"[bold]Files Changed:[/bold] {len(files)}\n{file_lines}\n\n"
                 f"[bold]Total Hunks:[/bold] {len(hunks)}",
-                title="📝 [bold yellow]Patch Summary[/bold yellow]",
+                title="📝 [bold yellow]Patch Hunk Summary[/bold yellow]",
                 border_style="yellow",
                 box=box.ROUNDED,
             )
         )
 
         for idx, hunk in enumerate(hunks, 1):
-            ts = (
-                hunk.get("target_symbol", {})
-                if isinstance(hunk, dict)
-                else getattr(hunk, "target_symbol", {})
-            )
+            if isinstance(hunk, dict):
+                act = hunk.get("action", "MODIFY")
+                ts = hunk.get("target_symbol", {})
+            else:
+                act = getattr(hunk, "action", "MODIFY")
+                ts = getattr(hunk, "target_symbol", {})
+
             if isinstance(ts, dict):
                 fp = ts.get("file_path", hunk.get("file_path", "unknown"))
                 sym = ts.get("qualified_symbol_name", "")
@@ -570,8 +603,29 @@ class ForgeREPL:
                 sym = getattr(ts, "qualified_symbol_name", "")
                 code = getattr(ts, "replacement_code", "")
 
-            title = f"Hunk {idx}: {fp}" + (f" -> symbol: {sym}" if sym else "")
-            syntax = Syntax(code or "# Empty patch\n", "python", theme="monokai", line_numbers=True)
+            act_str = str(act.value) if hasattr(act, "value") else str(act)
+            title = f"Hunk {idx}: [{act_str}] {fp}" + (f" -> symbol: {sym}" if sym else "")
+
+            # Format replacement code as unified diff lines for rich color
+            # highlighting (+ green, - red)
+            diff_lines = []
+            for line in (code or "# Empty patch snippet\n").splitlines():
+                if line.startswith("+") or line.startswith("-"):
+                    diff_lines.append(line)
+                elif act_str in ("ADD", "MODIFY", "REPLACE_FILE"):
+                    diff_lines.append(f"+ {line}")
+                elif act_str == "DELETE":
+                    diff_lines.append(f"- {line}")
+                else:
+                    diff_lines.append(f"  {line}")
+            diff_text = "\n".join(diff_lines)
+
+            syntax = Syntax(
+                diff_text,
+                "diff",
+                theme="monokai",
+                line_numbers=True,
+            )
             console.print(
                 Panel(
                     syntax,

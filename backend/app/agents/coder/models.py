@@ -16,6 +16,15 @@ class ExecutionPolicy(str, Enum):
     AUTONOMOUS = "AUTONOMOUS"
 
 
+class SymbolAction(str, Enum):
+    """Explicit symbol operation type for surgical patching."""
+
+    MODIFY = "MODIFY"
+    ADD = "ADD"
+    DELETE = "DELETE"
+    REPLACE_FILE = "REPLACE_FILE"
+
+
 class ModelTier(str, Enum):
     """Escalation model tiers for code reasoning."""
 
@@ -43,6 +52,9 @@ class SymbolTarget:
     qualified_symbol_name: str
     expected_content_hash: str
     replacement_code: str
+    original_snippet: str = ""
+    anchor_symbol: str = ""
+    anchor_position: str = "after"  # "after", "before", "replace"
 
     @classmethod
     def compute_hash(cls, source_code: str) -> str:
@@ -55,6 +67,9 @@ class SymbolTarget:
             "qualified_symbol_name": self.qualified_symbol_name,
             "expected_content_hash": self.expected_content_hash,
             "replacement_code": self.replacement_code,
+            "original_snippet": self.original_snippet,
+            "anchor_symbol": self.anchor_symbol,
+            "anchor_position": self.anchor_position,
         }
 
     @classmethod
@@ -64,6 +79,9 @@ class SymbolTarget:
             qualified_symbol_name=data.get("qualified_symbol_name", ""),
             expected_content_hash=data.get("expected_content_hash", ""),
             replacement_code=data.get("replacement_code", ""),
+            original_snippet=data.get("original_snippet", ""),
+            anchor_symbol=data.get("anchor_symbol", ""),
+            anchor_position=data.get("anchor_position", "after"),
         )
 
 
@@ -72,14 +90,19 @@ class CodeHunk:
     """Targeted replacement hunk within a source file."""
 
     target_symbol: SymbolTarget
+    action: SymbolAction = SymbolAction.MODIFY
     start_byte: int | None = None
     end_byte: int | None = None
     start_line: int | None = None
     end_line: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
+        action_val = (
+            self.action.value if isinstance(self.action, SymbolAction) else str(self.action)
+        )
         return {
             "target_symbol": self.target_symbol.to_dict(),
+            "action": action_val,
             "start_byte": self.start_byte,
             "end_byte": self.end_byte,
             "start_line": self.start_line,
@@ -90,8 +113,15 @@ class CodeHunk:
     def from_dict(cls, data: dict[str, Any]) -> "CodeHunk":
         ts_data = data.get("target_symbol", {})
         ts = SymbolTarget.from_dict(ts_data) if isinstance(ts_data, dict) else ts_data
+        raw_act = data.get("action", SymbolAction.MODIFY)
+        try:
+            act = SymbolAction(raw_act)
+        except ValueError:
+            act = SymbolAction.MODIFY
+
         return cls(
             target_symbol=ts,
+            action=act,
             start_byte=data.get("start_byte"),
             end_byte=data.get("end_byte"),
             start_line=data.get("start_line"),
