@@ -3,12 +3,15 @@ Phase 10F: Rich Terminal UI Component Helpers
 Provides spinners, progress panels, syntax highlighted diffs, and interactive prompts.
 """
 
+from pathlib import Path
 from typing import Any
 
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Confirm
-from rich.table import Table
+
+from app.agents.plan_models import ImplementationPlan
 
 console = Console()
 
@@ -28,15 +31,16 @@ class TerminalUI:
         )
 
     @classmethod
-    def print_plan(cls, plan_data: dict[str, Any]) -> None:
-        table = Table(title="[bold green]Generated Implementation Plan[/bold green]")
-        table.add_column("Property", style="cyan")
-        table.add_column("Details", style="white")
-
-        table.add_row("Summary", str(plan_data.get("summary", "")))
-        table.add_row("Allowed Files", ", ".join(plan_data.get("allowed_files", [])))
-
-        console.print(table)
+    def plan_panel(cls, plan_data: dict[str, Any], plan_path: Path | None = None) -> Panel:
+        """The stored plan rendered for Gate 1 review; callers print it on their console."""
+        plan = ImplementationPlan.from_dict(plan_data)
+        subtitle = f"[dim]{plan_path}[/dim]" if plan_path else None
+        return Panel(
+            Markdown(plan.to_markdown()),
+            title="🗺️ [bold green]Gate 1 — Implementation Plan[/bold green]",
+            subtitle=subtitle,
+            border_style="green",
+        )
 
     @classmethod
     def print_diff_stats(cls, files_count: int, lines_added: int) -> None:

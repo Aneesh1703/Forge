@@ -9,14 +9,39 @@ from pathlib import Path
 from typing import Any
 
 from app.agents.candidate.models import CandidateContext
-from app.agents.coder.complexity import ComplexityScorer
-from app.agents.coder.context import MinimalContextBuilder, MultiFileContextBuilder
+from app.agents.coder.context import MultiFileContextBuilder
 from app.agents.coder.models import CodeHunk, CodePatch, SymbolAction, SymbolTarget
 from app.agents.coder.prompts import CODER_SYSTEM_PROMPT
 from app.agents.llm_service import LLMService
-from app.agents.plan_models import ImplementationPlan
+from app.agents.plan_models import FileActionType, ImplementationPlan
 
 logger = logging.getLogger(__name__)
+
+_ACTION_HINTS = {
+    FileActionType.MODIFY: "edit in place",
+    FileActionType.CREATE: "new file: use ACTION: REPLACE_FILE with the full contents",
+    FileActionType.DELETE: "remove the named symbols",
+}
+
+
+def format_plan_for_prompt(plan: ImplementationPlan) -> str:
+    """The plan as the coder sees it: goal, the only files it may change, and the steps."""
+    lines = [f"Summary: {plan.summary}"]
+    if plan.rationale:
+        lines.append(f"Rationale: {plan.rationale}")
+    lines.append("Files you may change:")
+    for fa in plan.file_actions:
+        symbols = f" — symbols: {', '.join(fa.target_symbols)}" if fa.target_symbols else ""
+        why = f" — {fa.description}" if fa.description else ""
+        hint = _ACTION_HINTS[fa.action_type]
+        lines.append(f"- {fa.action_type.value} {fa.file_path} ({hint}){symbols}{why}")
+    if plan.tasks:
+        lines.append("Steps:")
+        for task in sorted(plan.tasks, key=lambda t: t.step_number):
+            lines.append(f"{task.step_number}. {task.title}: {task.description}")
+    if plan.test_targets:
+        lines.append(f"Tests that must pass: {', '.join(plan.test_targets)}")
+    return "\n".join(lines)
 
 
 class CodingAgent:
@@ -66,36 +91,11 @@ class CodingAgent:
                 llm_service = DeepSeekLLMService(api_key=deepseek_key)
 
         self.llm_service = llm_service
-        self.context_builder = MinimalContextBuilder(self.repo_root)
         self.multifile_context_builder = MultiFileContextBuilder(self.repo_root)
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-
-    def generate_patch(
-        self,
-        plan: ImplementationPlan,
-        attempt_number: int = 1,
-        symbol_replacements: list[SymbolTarget] | None = None,
-    ) -> CodePatch:
-        """Generates a structured CodePatch adhering to allowed_files & hash bounds."""
-        complexity = ComplexityScorer.evaluate(plan, attempt_number=attempt_number)
-        context_str = self.context_builder.build_context(plan, complexity)  # noqa: F841
-
-        patch = CodePatch(
-            files_changed=sorted(list(plan.allowed_files)),
-            explanation=f"Generated patch for plan #{plan.plan_id} (Attempt {attempt_number})",
-            confidence=0.95,
-        )
-
-        if symbol_replacements:
-            for target in symbol_replacements:
-                if target.file_path in plan.allowed_files:
-                    hunk = CodeHunk(target_symbol=target, action=SymbolAction.MODIFY)
-                    patch.hunks.append(hunk)
-
-        return patch
 
     async def generate_multifile_patch(
         self,
@@ -103,13 +103,15 @@ class CodingAgent:
         candidate_context: CandidateContext,
         attempt_number: int = 1,
         error_feedback: str = "",
+        plan: ImplementationPlan | None = None,
     ) -> CodePatch:
         """Generates a multi-file CodePatch via a single unified LLM inference pass.
 
         Steps:
           1. Build rich multi-file context from all candidate files.
           2. Construct a single prompt that asks the LLM to identify which
-             files actually need changes and produce code for each.
+             files actually need changes and produce code for each. With a plan, the
+             prompt carries it and names the only files the patch may touch.
           3. Parse the LLM response into per-file SymbolTargets.
           4. Return a CodePatch with one hunk per changed file.
         """
@@ -131,19 +133,28 @@ class CodingAgent:
                 "Fix the errors listed above.\n"
             )
 
-        candidate_file_list = "\n".join(
-            f"- {cf.file_path} (score: {cf.score.total_score})"
-            for cf in candidate_context.candidate_files
-        )
+        if plan is not None:
+            files_block = f"APPROVED PLAN:\n{format_plan_for_prompt(plan)}\n"
+            scope_rule = (
+                "2. Follow the approved plan. Change ONLY files listed under "
+                "'Files you may change'; a patch touching any other file is rejected.\n"
+            )
+        else:
+            candidate_file_list = "\n".join(
+                f"- {cf.file_path} (score: {cf.score.total_score})"
+                for cf in candidate_context.candidate_files
+            )
+            files_block = f"CANDIDATE FILES:\n{candidate_file_list}\n"
+            scope_rule = "2. Identify ONLY the files that actually need code changes.\n"
 
         prompt = (
             f"ISSUE: {issue_prompt}\n\n"
-            f"CANDIDATE FILES:\n{candidate_file_list}\n"
+            f"{files_block}"
             f"{diagnostic_block}\n"
             f"REPOSITORY CONTEXT:\n{unified_context}\n\n"
             "INSTRUCTIONS:\n"
             "1. Analyze the issue and the candidate file snippets above.\n"
-            "2. Identify ONLY the files that actually need code changes.\n"
+            f"{scope_rule}"
             "3. For each hunk that needs a fix, output a section like:\n"
             "   ### FILE: <relative/path/to/file.py>\n"
             "   ### ACTION: MODIFY | ADD | DELETE | REPLACE_FILE\n"

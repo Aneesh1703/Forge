@@ -5,6 +5,9 @@ LLM Service Interface & Mock Provider for Agent Reasoning
 import json
 from typing import Any, Protocol
 
+# Seconds before a provider request is abandoned, so a stalled API can't hang a job forever.
+LLM_REQUEST_TIMEOUT_S = 120
+
 
 class LLMService(Protocol):
     """Protocol interface for LLM text completion providers."""
@@ -101,7 +104,7 @@ class DeepSeekLLMService:
                     "Content-Type": "application/json",
                 },
             )
-            with urllib.request.urlopen(req) as resp:
+            with urllib.request.urlopen(req, timeout=LLM_REQUEST_TIMEOUT_S) as resp:
                 res_data = json.loads(resp.read().decode("utf-8"))
                 content = str(res_data["choices"][0]["message"]["content"])
                 usage = res_data.get("usage", {})
@@ -158,7 +161,7 @@ class OpenAILLMService:
                     "Content-Type": "application/json",
                 },
             )
-            with urllib.request.urlopen(req) as resp:
+            with urllib.request.urlopen(req, timeout=LLM_REQUEST_TIMEOUT_S) as resp:
                 res_data = json.loads(resp.read().decode("utf-8"))
                 content = str(res_data["choices"][0]["message"]["content"])
                 usage = res_data.get("usage", {})
@@ -215,7 +218,7 @@ class AnthropicLLMService:
                     "Content-Type": "application/json",
                 },
             )
-            with urllib.request.urlopen(req) as resp:
+            with urllib.request.urlopen(req, timeout=LLM_REQUEST_TIMEOUT_S) as resp:
                 res_data = json.loads(resp.read().decode("utf-8"))
                 content = str(res_data["content"][0]["text"])
                 usage = res_data.get("usage", {})
@@ -276,7 +279,7 @@ class GeminiLLMService:
                 data=json.dumps(payload).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
             )
-            with urllib.request.urlopen(req) as resp:
+            with urllib.request.urlopen(req, timeout=LLM_REQUEST_TIMEOUT_S) as resp:
                 res_data = json.loads(resp.read().decode("utf-8"))
                 content = str(res_data["candidates"][0]["content"]["parts"][0]["text"])
                 usage = res_data.get("usageMetadata", {})

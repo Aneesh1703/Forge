@@ -1,6 +1,5 @@
 import asyncio
 from datetime import datetime, timezone
-from typing import Any
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,7 +14,6 @@ from app.db.repositories import (
 from app.indexer.batching import batch_items
 from app.indexer.config import IndexerConfig
 from app.indexer.vector_indexer import IncrementalVectorIndexer
-from app.orchestration.workflow import ForgeStateGraph
 from app.parser.adapters.adapter_factory import AdapterFactory
 from app.parser.extractor import SymbolExtractor
 from app.parser.models import CodeSymbol
@@ -46,12 +44,6 @@ class RepositoryIndexer:
         self._vector_indexer = vector_indexer
         self._parser_factory = ParserFactory()
         self._adapter_factory = AdapterFactory()
-
-    async def index_with_graph(self, repository: Repository) -> None:
-        """Executes repository indexing via stateful LangGraph StateGraph DAG execution."""
-        sg: ForgeStateGraph[Any] = ForgeStateGraph()
-        sg.add_node("index", lambda state: state)
-        await self.index(repository)
 
     async def index(self, repository: Repository) -> None:
         root_path = repository.root_path

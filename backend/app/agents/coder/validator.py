@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.agents.coder.models import CodePatch, SymbolAction, SymbolTarget
+from app.agents.coder.paths import UnsafePathError, resolve_in_repo
 from app.agents.plan_models import ImplementationPlan
 
 
@@ -18,6 +19,7 @@ class PatchValidationResult:
     is_valid: bool = True
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    paths_valid: bool = True
     allowed_files_valid: bool = True
     budget_valid: bool = True
     hashes_valid: bool = True
@@ -45,17 +47,28 @@ class PatchSafetyGate:
         """Executes all deterministic safety checks against the patch and working tree."""
         result = PatchValidationResult()
 
+        # 0. Path Containment Check — later checks read these paths, so stop on failure.
+        path_errors = self._path_errors(patch)
+        if path_errors:
+            result.is_valid = False
+            result.paths_valid = False
+            result.errors.extend(path_errors)
+            return result
+
         # 1. Allowed Files Boundary Check
-        # Automatically permit new files created via REPLACE_FILE/ADD or non-existent files
-        new_created_files = {
-            hunk.target_symbol.file_path
-            for hunk in patch.hunks
-            if hunk.action in (SymbolAction.REPLACE_FILE, SymbolAction.ADD)
-            or not (self.repo_root / hunk.target_symbol.file_path).exists()
-        }
-        effective_allowed_files = plan.allowed_files.union(new_created_files)
-        patch_files = set(patch.files_changed)
-        unauthorized_files = patch_files - effective_allowed_files
+        # Downstream commit/rollback only see files_changed, so every hunk must be listed.
+        hunk_files = {hunk.target_symbol.file_path for hunk in patch.hunks}
+        unlisted = hunk_files - set(patch.files_changed)
+        if unlisted:
+            result.is_valid = False
+            result.allowed_files_valid = False
+            result.errors.append(
+                f"Hunks target files not listed in files_changed: {sorted(unlisted)}"
+            )
+
+        # The approved plan is the whole scope: a new file must be a planned CREATE.
+        patch_files = set(patch.files_changed) | hunk_files
+        unauthorized_files = patch_files - plan.allowed_files
 
         if unauthorized_files:
             result.is_valid = False
@@ -66,11 +79,11 @@ class PatchSafetyGate:
             )
 
         # 2. Patch Change Budget Check
-        if len(patch.files_changed) > self.max_files:
+        if len(patch_files) > self.max_files:
             result.is_valid = False
             result.budget_valid = False
             result.errors.append(
-                f"Files changed count ({len(patch.files_changed)}) exceeds limit ({self.max_files})"
+                f"Files changed count ({len(patch_files)}) exceeds limit ({self.max_files})"
             )
 
         if len(patch.hunks) > self.max_hunks:
@@ -151,3 +164,14 @@ class PatchSafetyGate:
             pass
 
         return result
+
+    def _path_errors(self, patch: CodePatch) -> list[str]:
+        """Rejects any patch path that is absolute, escapes the repo, or targets .git."""
+        paths = set(patch.files_changed) | {h.target_symbol.file_path for h in patch.hunks}
+        errors: list[str] = []
+        for rel_path in sorted(paths):
+            try:
+                resolve_in_repo(self.repo_root, rel_path)
+            except UnsafePathError as e:
+                errors.append(str(e))
+        return errors

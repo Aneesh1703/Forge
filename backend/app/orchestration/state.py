@@ -52,15 +52,22 @@ class JobState:
 
     # Step Execution Artifacts & Contexts
     issue_understanding: dict[str, Any] | None = None
-    evidence_context: str | None = None
+    evidence_context: str | None = None  # legacy, unused; kept so old job files load
+    evidence_graph: dict[str, Any] | None = None
     implementation_plan: dict[str, Any] | None = None
     code_patch: dict[str, Any] | None = None
     worktree_path: str | None = None
+    gate_1_approved: bool = False
     repair_attempts: int = 0
+    repair_summary: str | None = None
+    # Every patch attempt, including safety-gate rejections before testing, in order.
+    repair_history: list[dict[str, Any]] = field(default_factory=list)
     test_results: list[dict[str, Any]] = field(default_factory=list)
     review_decision: str | None = None
+    gate_2_reasons: list[str] = field(default_factory=list)
     repo_gate_passed: bool = False
     git_branch: str | None = None
+    base_branch: str | None = None
     commit_sha: str | None = None
     pr_url: str | None = None
     error_message: str | None = None

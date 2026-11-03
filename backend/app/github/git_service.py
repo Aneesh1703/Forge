@@ -4,48 +4,187 @@ Manages local git feature branch creation, conventional commit formatting, stagi
 """
 
 import logging
+import os
 import subprocess
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from app.agents.coder.models import CodePatch
 from app.agents.plan_models import ImplementationPlan
+from app.github.auth import GitHubAuthManager
+from app.github.git_remote import (
+    DEFAULT_TOKEN_HOSTS,
+    RemoteInfo,
+    parse_remote_url,
+    redact_credentials,
+    token_auth_env,
+)
 
 logger = logging.getLogger(__name__)
+
+FORGE_IDENTITY_ENV = {
+    "GIT_AUTHOR_NAME": "Forge Agent Engine",
+    "GIT_AUTHOR_EMAIL": "forge-agent@users.noreply.github.com",
+    "GIT_COMMITTER_NAME": "Forge Agent Engine",
+    "GIT_COMMITTER_EMAIL": "forge-agent@users.noreply.github.com",
+}
+
+
+class GitError(RuntimeError):
+    """Raised when a git command fails. Messages are credential-redacted."""
 
 
 class GitService:
     """Provides pure git operations without external GitHub API dependencies."""
 
-    def __init__(self, repo_root: str | Path) -> None:
+    def __init__(
+        self,
+        repo_root: str | Path,
+        token_provider: Callable[[], str | None] | None = None,
+        token_hosts: Iterable[str] = DEFAULT_TOKEN_HOSTS,
+    ) -> None:
         self.repo_root = Path(repo_root).resolve()
+        self._token_provider = token_provider or GitHubAuthManager.get_token
+        # The GitHub token is only ever sent to these hosts (add GHE hosts explicitly).
+        self._token_hosts = frozenset(h.casefold() for h in token_hosts)
 
-    def _run_git(self, args: list[str]) -> str:
-        """Executes a git command synchronously inside the repository directory."""
-        try:
-            res = subprocess.run(
-                ["git"] + args,
-                cwd=self.repo_root,
-                capture_output=True,
-                encoding="utf-8",
-                errors="replace",
-                check=True,
-            )
-            return res.stdout.strip()
-        except subprocess.CalledProcessError as e:
-            err_msg = (e.stderr or e.stdout or "").strip()
-            logger.error(f"Git command failed: git {' '.join(args)}: {err_msg}")
-            raise RuntimeError(f"Git execution error: {err_msg}") from e
+    # ------------------------------------------------------------------
+    # Command execution
+    # ------------------------------------------------------------------
+
+    def _git(
+        self, args: list[str], extra_env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        env = {**os.environ, **extra_env} if extra_env else None
+        return subprocess.run(
+            ["git", *args],
+            cwd=self.repo_root,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            env=env,
+        )
+
+    def _run_git(self, args: list[str], extra_env: dict[str, str] | None = None) -> str:
+        """Runs git and returns stdout; raises GitError on a non-zero exit.
+
+        Only the subcommand is logged — arguments may carry commit messages or paths.
+        """
+        res = self._git(args, extra_env)
+        if res.returncode != 0:
+            err_msg = redact_credentials((res.stderr or res.stdout or "").strip())
+            logger.error(f"git {args[0]} failed: {err_msg}")
+            raise GitError(f"git {args[0]} failed: {err_msg}")
+        return res.stdout.strip()
+
+    # ------------------------------------------------------------------
+    # Branches
+    # ------------------------------------------------------------------
+
+    def current_branch(self) -> str | None:
+        """Current branch name, or None when HEAD is detached."""
+        return self._git(["symbolic-ref", "--short", "-q", "HEAD"]).stdout.strip() or None
+
+    def current_ref(self) -> str:
+        """Current branch name, or the commit SHA when HEAD is detached."""
+        return self.current_branch() or self._run_git(["rev-parse", "HEAD"])
+
+    def checkout(self, ref: str) -> None:
+        self._run_git(["checkout", ref])
 
     def create_feature_branch(self, job_id: str) -> str:
-        """Creates and checks out a new git feature branch 'forge/issue-<job_id>'."""
-        branch_name = f"forge/issue-{job_id[:8]}"
-        try:
-            self._run_git(["checkout", "-B", branch_name])
-            logger.info(f"Created/reset feature branch: {branch_name}")
-        except Exception as e:
-            logger.warning(f"Branch checkout warning for {branch_name}: {e}")
+        """Creates and checks out a new 'forge/issue-<job_id>' branch from HEAD.
 
+        Never resets an existing branch: raises GitError if the name is taken.
+        """
+        branch_name = f"forge/issue-{job_id[:8]}"
+        if self._git(["rev-parse", "--verify", "-q", f"refs/heads/{branch_name}"]).returncode == 0:
+            raise GitError(f"Branch {branch_name} already exists; refusing to overwrite it.")
+        self._run_git(["checkout", "-b", branch_name])
+        logger.info(f"Created feature branch: {branch_name}")
         return branch_name
+
+    def default_base_branch(self, remote_name: str = "origin") -> str:
+        """The remote's default branch (from <remote>/HEAD), falling back to 'main'."""
+        ref = self._git(["symbolic-ref", "--short", "-q", f"refs/remotes/{remote_name}/HEAD"])
+        return ref.stdout.strip().removeprefix(f"{remote_name}/") or "main"
+
+    def delete_branch(self, branch_name: str) -> None:
+        self._run_git(["branch", "-D", branch_name])
+
+    # ------------------------------------------------------------------
+    # Working tree
+    # ------------------------------------------------------------------
+
+    def dirty_paths(self, paths: Iterable[str]) -> list[str]:
+        """Paths (of those given) with uncommitted, untracked, or gitignored local content.
+
+        Ignored files count too: they hold user data that discard_paths would delete.
+        """
+        path_list = sorted(set(paths))
+        if not path_list:
+            return []
+        res = self._git(
+            [
+                "status",
+                "--porcelain",
+                "-z",
+                "--untracked-files=all",
+                "--ignored=matching",
+                "--",
+                *path_list,
+            ]
+        )
+        if res.returncode != 0:
+            raise GitError(f"git status failed: {redact_credentials(res.stderr.strip())}")
+
+        # -z entries are "XY <path>\0"; renames/copies add the original path as an extra entry.
+        entries = res.stdout.split("\0")
+        dirty: list[str] = []
+        i = 0
+        while i < len(entries):
+            entry = entries[i]
+            if entry:
+                dirty.append(entry[3:])
+                if entry[0] in "RC":
+                    i += 1
+            i += 1
+        return dirty
+
+    def discard_paths(self, paths: Iterable[str]) -> None:
+        """Restores the given paths to HEAD, deleting ones HEAD does not track.
+
+        Only safe for paths that were clean beforehand (see dirty_paths).
+        """
+        for rel_path in sorted(set(paths)):
+            self._git(["reset", "-q", "--", rel_path])
+            tracked = self._git(["cat-file", "-e", f"HEAD:{rel_path}"]).returncode == 0
+            if tracked:
+                self._run_git(["checkout", "HEAD", "--", rel_path])
+            else:
+                (self.repo_root / rel_path).unlink(missing_ok=True)
+
+    def show_commit(self, ref: str) -> str:
+        """Returns the patch introduced by a commit, or "" if it cannot be read."""
+        try:
+            return self._run_git(["show", "--format=", ref])
+        except GitError:
+            return ""
+
+    def get_working_tree_diff(self) -> str:
+        """Returns physical 'git diff' string for current working tree / staged changes."""
+        try:
+            diff = self._run_git(["diff", "HEAD"])
+            if not diff.strip():
+                diff = self._run_git(["diff"])
+            return diff
+        except GitError:
+            return ""
+
+    # ------------------------------------------------------------------
+    # Commits
+    # ------------------------------------------------------------------
 
     def format_conventional_commit(
         self,
@@ -61,124 +200,79 @@ class GitService:
         lines = [
             f"fix(core): {clean_summary}",
             "",
-            "Target Files:",
+            "Files Changed:",
         ]
-        for f in plan.allowed_files:
+        for f in sorted(set(patch.files_changed)):
             lines.append(f"  - {f}")
         lines.append("")
         lines.append("Generated by Forge Agent Engine")
         return "\n".join(lines)
 
-    def _ensure_git_user_config(self) -> None:
-        """Ensures git user.name and user.email are configured for commits."""
-        try:
-            res = self._run_git(["config", "user.email"])
-            if not res:
-                self._run_git(["config", "user.email", "forge-agent@users.noreply.github.com"])
-        except Exception:
-            try:
-                self._run_git(["config", "user.email", "forge-agent@users.noreply.github.com"])
-            except Exception:
-                pass
+    def _identity_env(self) -> dict[str, str]:
+        """Forge's commit identity, used only when the repo has none configured.
 
-        try:
-            res = self._run_git(["config", "user.name"])
-            if not res:
-                self._run_git(["config", "user.name", "Forge Agent Engine"])
-        except Exception:
-            try:
-                self._run_git(["config", "user.name", "Forge Agent Engine"])
-            except Exception:
-                pass
-
-    def get_working_tree_diff(self) -> str:
-        """Returns physical 'git diff' string for current working tree / staged changes."""
-        try:
-            diff = self._run_git(["diff", "HEAD"])
-            if not diff.strip():
-                diff = self._run_git(["diff"])
-            return diff
-        except Exception:
-            return ""
+        Passed via environment so the user's git config is never modified.
+        """
+        has_identity = all(
+            self._git(["config", key]).stdout.strip() for key in ("user.name", "user.email")
+        )
+        return {} if has_identity else dict(FORGE_IDENTITY_ENV)
 
     def commit_patch(
         self,
         plan: ImplementationPlan,
         patch: CodePatch,
     ) -> str:
-        """Stages modified files and creates a local conventional commit."""
-        self._ensure_git_user_config()
-        try:
-            self._run_git(["add", "-A"])
-        except Exception:
-            for file_path in patch.files_changed:
-                try:
-                    self._run_git(["add", file_path])
-                except Exception:
-                    pass
+        """Stages and commits exactly the patch's files; returns the new commit SHA.
+
+        Other local changes — staged or not — are left out of the commit.
+        Raises GitError if staging or committing fails or the patch changed nothing.
+        """
+        paths = sorted(set(patch.files_changed))
+        if not paths:
+            raise GitError("Patch lists no files to commit.")
+
+        self._run_git(["add", "-A", "--", *paths])
+        if not self._run_git(["diff", "--cached", "--name-only", "--", *paths]):
+            raise GitError("Patch produced no changes to commit.")
 
         commit_msg = self.format_conventional_commit(plan, patch)
-        try:
-            self._run_git(["commit", "-m", commit_msg])
-        except RuntimeError as e:
-            msg = str(e).lower()
-            if any(k in msg for k in ["nothing to commit", "nothing added to commit", "clean"]):
-                logger.info("Git working tree clean or patch already committed.")
-            else:
-                try:
-                    simple_msg = f"fix: {plan.summary[:50] if plan.summary else 'resolve issue'}"
-                    self._run_git(["commit", "-m", simple_msg])
-                except RuntimeError as inner_e:
-                    inner_msg = str(inner_e).lower()
-                    if any(
-                        k in inner_msg
-                        for k in ["nothing to commit", "nothing added to commit", "clean"]
-                    ):
-                        logger.info("Git working tree clean or patch already committed.")
-                    else:
-                        logger.warning(f"Git commit warning: {inner_e}")
+        self._run_git(
+            ["commit", "-m", commit_msg, "--only", "--", *paths],
+            extra_env=self._identity_env(),
+        )
+        return self._run_git(["rev-parse", "HEAD"])
 
-        try:
-            return self._run_git(["rev-parse", "HEAD"])
-        except Exception:
-            return "NO_COMMIT"
+    # ------------------------------------------------------------------
+    # Remotes
+    # ------------------------------------------------------------------
 
-    def push_to_remote(self, branch_name: str, remote_name: str = "origin") -> bool:
-        """Pushes the feature branch to origin remote repository using auth token if available."""
-        try:
-            from app.github.auth import GitHubAuthManager
+    def _remote_info(self, remote_name: str = "origin") -> RemoteInfo | None:
+        res = self._git(["remote", "get-url", remote_name])
+        return parse_remote_url(res.stdout) if res.returncode == 0 else None
 
-            token = GitHubAuthManager.get_token()
-            owner, repo = self.get_remote_owner_repo()
+    def _push_auth_env(self, remote: RemoteInfo | None) -> dict[str, str] | None:
+        """Token env for trusted https GitHub hosts only; everything else uses the
+        user's own credential helper or ssh setup."""
+        if not remote or remote.scheme != "https":
+            return None
+        if remote.host.casefold() not in self._token_hosts:
+            return None
+        token = self._token_provider()
+        return token_auth_env(remote, token, os.environ) if token else None
 
-            if token and owner != "local":
-                auth_url = f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
-                try:
-                    self._run_git(["push", "-u", auth_url, f"{branch_name}:{branch_name}"])
-                    return True
-                except Exception as auth_err:
-                    logger.warning(f"Token-authenticated push warning: {auth_err}")
-        except Exception:
-            pass
+    def push_to_remote(self, branch_name: str, remote_name: str = "origin") -> None:
+        """Pushes the branch to the named remote. Raises GitError on failure.
 
-        try:
-            self._run_git(["push", "-u", remote_name, branch_name])
-            return True
-        except RuntimeError as e:
-            logger.warning(f"Failed to push {branch_name} to remote {remote_name}: {e}")
-            return False
+        A GitHub token is supplied through environment-scoped git config — never the
+        URL — and only to hosts in token_hosts.
+        """
+        auth_env = self._push_auth_env(self._remote_info(remote_name))
+        self._run_git(["push", "-u", remote_name, branch_name], extra_env=auth_env)
 
     def get_remote_owner_repo(self) -> tuple[str, str]:
-        """Parses owner and repo name from git remote URL."""
-        try:
-            url = self._run_git(["remote", "get-url", "origin"])
-            clean_url = url.removesuffix(".git")
-            if ":" in clean_url and not clean_url.startswith("http"):
-                parts = clean_url.split(":")[-1].split("/")
-            else:
-                parts = clean_url.rstrip("/").split("/")[-2:]
-            if len(parts) >= 2:
-                return parts[-2], parts[-1]
-        except Exception:
-            pass
+        """Parses owner and repo name from the origin remote URL."""
+        remote = self._remote_info()
+        if remote:
+            return remote.owner, remote.repo
         return "local", self.repo_root.name

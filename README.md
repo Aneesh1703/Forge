@@ -103,7 +103,15 @@ git clone https://github.com/Aneesh1703/Forge.git
 cd Forge
 ```
 
-### 2. Environment Setup & Dependencies
+### 2. Start Infrastructure Services (Docker Compose)
+
+Spin up PostgreSQL 17, Redis 7, Qdrant Vector Store, and Ollama in background containers:
+
+```powershell
+docker compose up -d
+```
+
+### 3. Environment Setup & Dependencies
 
 ```powershell
 cd backend
@@ -112,7 +120,7 @@ python -m venv .venv
 pip install -e .
 ```
 
-### 3. Configure API Credentials (OS Vault)
+### 4. Configure API Credentials (OS Vault)
 
 Launch the Forge REPL and set your secret credentials securely:
 
@@ -127,7 +135,7 @@ forge ❯ /config set-key -p github -k ghp_YourGitHubPersonalAccessToken
 forge ❯ /config set-key -p deepseek -k sk-YourDeepSeekApiKey
 ```
 
-### 4. Execute Repair & Publish PR
+### 5. Execute Repair & Publish PR
 
 Set execution policy and start automated repair:
 

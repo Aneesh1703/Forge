@@ -7,9 +7,38 @@ import ast
 from pathlib import Path
 from typing import Any
 
-from app.agents.candidate.models import CandidateContext
+from app.agents.candidate.models import CandidateContext, CandidateFile, CandidateScore
 from app.agents.coder.models import ComplexityScore
-from app.agents.plan_models import ImplementationPlan
+from app.agents.plan_models import FileActionType, ImplementationPlan
+
+
+def plan_context(
+    plan: ImplementationPlan, repo_root: str | Path, issue_prompt: str
+) -> CandidateContext:
+    """The coder's context is exactly the plan's existing files and test targets.
+
+    Files the plan creates don't exist yet, so they have nothing to show; the plan itself
+    tells the coder about them.
+    """
+    root = Path(repo_root).resolve()
+
+    def existing(paths: list[str], is_test: bool) -> list[CandidateFile]:
+        return [
+            CandidateFile(
+                file_path=p, abs_path=root / p, score=CandidateScore(p), is_test_file=is_test
+            )
+            for p in dict.fromkeys(paths)
+            if (root / p).is_file()
+        ]
+
+    source_files = [
+        fa.file_path for fa in plan.file_actions if fa.action_type != FileActionType.CREATE
+    ]
+    return CandidateContext(
+        issue_prompt=issue_prompt,
+        candidate_files=existing(source_files, is_test=False),
+        test_files=existing(plan.test_targets, is_test=True),
+    )
 
 
 class MultiFileContextBuilder:

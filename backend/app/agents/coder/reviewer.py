@@ -5,9 +5,12 @@ Phase 9F: Final Reviewer Agent & Gate 2 Approval System
 from dataclasses import dataclass, field
 from enum import Enum
 
-from app.agents.coder.models import CodePatch, ExecutionPolicy
+from app.agents.coder.models import CodePatch, ExecutionPolicy, SymbolAction
 from app.agents.plan_models import ImplementationPlan
 from app.execution.models import TestResult
+
+SEMI_AUTONOMOUS_MAX_LINES = 50
+DESTRUCTIVE_ACTIONS = frozenset({SymbolAction.DELETE, SymbolAction.REPLACE_FILE})
 
 
 class ReviewDecision(str, Enum):
@@ -57,8 +60,12 @@ class FinalReviewerAgent:
         )
 
         # Basic health checks
-        if test_result and not test_result.passed:
-            comments.append("Tests failed on final patch execution.")
+        if test_result is None or not test_result.passed:
+            comments.append(
+                "Tests did not run on the final patch."
+                if test_result is None
+                else "Tests failed on final patch execution."
+            )
             return ReviewResult(
                 decision=ReviewDecision.REJECTED,
                 confidence=0.0,
@@ -89,7 +96,10 @@ class FinalReviewerAgent:
             requires_user_approval = False
             comments.append("Autonomous execution policy: Auto-approved Gate 2.")
         elif policy == ExecutionPolicy.SEMI_AUTONOMOUS:
-            if lines_added <= 50 and confidence >= 0.9:
+            # Whole-file replacements and deletions can remove arbitrary amounts of code,
+            # which lines_added cannot measure, so they always need a human.
+            destructive = any(h.action in DESTRUCTIVE_ACTIONS for h in patch.hunks)
+            if lines_added <= SEMI_AUTONOMOUS_MAX_LINES and not destructive:
                 requires_user_approval = False
                 comments.append("Semi-Autonomous policy: Low-risk patch auto-approved.")
             else:

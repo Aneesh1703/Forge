@@ -1,288 +1,282 @@
 """
-Evidence-Driven Planning Agent & Anti-Hallucination Synthesizer
+Evidence-Driven Planning Agent
 
-Synthesizes structured ImplementationPlan DTOs from EvidenceGraph nodes with minimal
-AST context pruning and 100% deterministic DB tree anti-hallucination verification.
-Supports automatic LLM fallback enhancement when evidence confidence is low (< 0.85).
+Turns an IssueUnderstanding and EvidenceGraph into an ImplementationPlan. Strong evidence
+is planned deterministically (no LLM); weak evidence goes to the LLM, whose reply is
+schema-checked and validated against the repository listing. Paths are never invented
+or corrected: anything that doesn't exist where it must is recorded as rejected.
 """
 
 import json
-import uuid
-from typing import Any, ClassVar
+import logging
+from dataclasses import dataclass, field
+from typing import ClassVar
 
 from app.agents.evidence.models import EvidenceGraph
-from app.agents.llm_service import LLMService, MockLLMService
+from app.agents.llm_service import LLMService
 from app.agents.models import IssueUnderstanding
 from app.agents.plan_models import (
     FileAction,
     FileActionType,
     ImplementationPlan,
+    PlanSource,
     PlanTask,
+    RejectedAction,
 )
-from app.orchestration.workflow import ForgeStateGraph
+from app.agents.plan_schema import (
+    LLMPlanResponse,
+    PlanParseError,
+    PlanValidation,
+    action_rejection,
+    parse_plan_response,
+    repo_dirs,
+    validate_plan_semantics,
+)
+from app.repository.listing import is_test_path
+
+logger = logging.getLogger(__name__)
+
+MAX_PROMPT_FILES = 200
+LLM_ATTEMPTS = 2  # the first try plus one re-prompt quoting the error
+
+
+@dataclass
+class _LLMAttempts:
+    """What the LLM produced across attempts: an accepted plan, or the last failure."""
+
+    response: LLMPlanResponse | None = None
+    validation: PlanValidation | None = None
+    error: str = ""
+    rejected: list[RejectedAction] = field(default_factory=list)
 
 
 class PlanningAgent:
-    """Evidence-Driven Planning Agent for Forge with LangGraph StateGraph integration."""
+    """Plans file actions from evidence, failing closed on every path."""
 
     SYSTEM_PLANNER_PROMPT: ClassVar[str] = (
-        "You are Forge's Planning Agent. Given sliced repository evidence and an "
-        "issue description, synthesize a minimal, structured implementation plan in valid "
-        "JSON format. Do NOT invent non-existent file paths or symbols."
+        "You are Forge's Planning Agent. Given an issue and repository evidence, produce a "
+        "minimal implementation plan as a single JSON object matching the given schema. "
+        "Never invent file paths or symbols."
     )
 
-    DEFAULT_TEST_COMMANDS: ClassVar[list[str]] = [
-        "uv run pytest tests/ -s",
-        "uv run ruff check .",
-    ]
-
-    def __init__(
-        self,
-        valid_files: set[str] | list[str] | None = None,
-        llm_service: LLMService | None = None,
-        confidence_threshold: float = 0.85,
-    ) -> None:
-        self._valid_files: set[str] = set(valid_files or [])
-        self._llm: LLMService = llm_service or MockLLMService()
-        self._confidence_threshold: float = confidence_threshold
-
-    async def synthesize_plan_with_graph(
-        self,
-        graph: EvidenceGraph,
-        understanding: IssueUnderstanding,
-        repository_id: uuid.UUID,
-        force_llm: bool = False,
-    ) -> ImplementationPlan:
-        """Executes planning workflow via a stateful LangGraph StateGraph DAG."""
-        sg: ForgeStateGraph[Any] = ForgeStateGraph()
-        sg.add_node("synth", lambda state: state)
-        return await self.synthesize_plan(
-            graph=graph,
-            understanding=understanding,
-            repository_id=repository_id,
-            force_llm=force_llm,
-        )
+    def __init__(self, llm_service: LLMService | None, valid_files: frozenset[str]) -> None:
+        """llm_service may be None: weak evidence then falls back to a deterministic plan."""
+        if not valid_files:
+            raise ValueError("valid_files is empty; refusing to plan without a file listing")
+        self._llm = llm_service
+        self._valid_files = frozenset(valid_files)
+        self._dirs = repo_dirs(self._valid_files)
 
     async def synthesize_plan(
         self,
-        graph: EvidenceGraph,
         understanding: IssueUnderstanding,
-        repository_id: uuid.UUID,
+        graph: EvidenceGraph,
+        *,
         force_llm: bool = False,
     ) -> ImplementationPlan:
-        """
-        Synthesizes an ImplementationPlan from an EvidenceGraph with anti-hallucination validation.
-        Uses cheap-first deterministic synthesis when confidence >= threshold, or falls back to LLM.
-        """
-        # 1. AST Minimal Context Slicing (~2,500 tokens context estimate)
-        estimated_tokens = self._estimate_sliced_tokens(graph, understanding)
+        """Routes to the LLM when forced or when the evidence gate found evidence weak."""
+        if force_llm or not graph.is_sufficient:
+            return await self._plan_via_llm(understanding, graph)
+        return self._plan_deterministically(understanding, graph, PlanSource.DETERMINISTIC)
 
-        # 2. Check if LLM Fallback is Required
-        use_llm = force_llm or (graph.overall_confidence < self._confidence_threshold)
+    # ------------------------------------------------------------------
+    # LLM path
+    # ------------------------------------------------------------------
 
-        if use_llm:
-            return await self._synthesize_plan_via_llm(
-                graph=graph,
-                understanding=understanding,
-                repository_id=repository_id,
-                estimated_tokens=estimated_tokens,
+    async def _plan_via_llm(
+        self, understanding: IssueUnderstanding, graph: EvidenceGraph
+    ) -> ImplementationPlan:
+        tokens_before = self._tokens_spent()
+        attempts = await self._run_llm_attempts(self._build_prompt(understanding, graph))
+        tokens_used = self._tokens_spent() - tokens_before
+
+        if attempts.response is None or attempts.validation is None:
+            reason = f"LLM planning failed after {LLM_ATTEMPTS} attempts: {attempts.error}"
+            logger.warning("Falling back to deterministic plan: %s", reason)
+            plan = self._plan_deterministically(
+                understanding, graph, PlanSource.DETERMINISTIC_FALLBACK
             )
+            plan.warnings.append(reason)
+            plan.rejected_actions = attempts.rejected + plan.rejected_actions
+            plan.tokens_used = tokens_used
+            return plan
 
-        # 3. Deterministic Synthesis Path (Confidence >= 0.85)
-        return self._synthesize_plan_deterministically(
-            graph=graph,
-            understanding=understanding,
-            repository_id=repository_id,
-            estimated_tokens=estimated_tokens,
+        resp, validation = attempts.response, attempts.validation
+        return ImplementationPlan.create(
+            repository_id=graph.repository_id,
+            summary=resp.summary,
+            file_actions=validation.accepted,
+            tasks=[
+                PlanTask(t.step_number, t.title, t.description, t.target_file) for t in resp.tasks
+            ],
+            confidence_score=(
+                resp.confidence if resp.confidence is not None else graph.top_confidence
+            ),
+            evidence_graph_id=graph.graph_id,
+            tokens_used=tokens_used,
+            source=PlanSource.LLM,
+            intent=resp.intent.value,
+            rationale=resp.rationale,
+            test_targets=self._merge_test_targets(validation.test_targets, understanding),
+            rejected_actions=validation.rejected,
+            warnings=validation.warnings,
         )
 
-    async def _synthesize_plan_via_llm(
-        self,
-        graph: EvidenceGraph,
-        understanding: IssueUnderstanding,
-        repository_id: uuid.UUID,
-        estimated_tokens: int,
-    ) -> ImplementationPlan:
-        """Fallback LLM-driven plan synthesis path when evidence confidence is low (< 0.85)."""
-        prompt_payload = {
+    async def _run_llm_attempts(self, prompt: str) -> _LLMAttempts:
+        """Asks once, re-asks once quoting the error, and stops at the first usable plan."""
+        attempts = _LLMAttempts()
+        if self._llm is None:
+            attempts.error = "no LLM service is configured"
+            return attempts
+        for _ in range(LLM_ATTEMPTS):
+            try:
+                reply = await self._llm.generate_completion(
+                    prompt=_with_retry_note(prompt, attempts.error),
+                    system_prompt=self.SYSTEM_PLANNER_PROMPT,
+                )
+            except Exception as exc:  # network, timeout, auth: retrying won't help
+                attempts.error = f"LLM call failed: {exc}"
+                break
+            try:
+                resp = parse_plan_response(reply)
+            except PlanParseError as exc:
+                attempts.error = str(exc)
+                continue
+            validation = validate_plan_semantics(resp, self._valid_files)
+            if validation.accepted:
+                attempts.response, attempts.validation = resp, validation
+                return attempts
+            attempts.rejected = validation.rejected
+            attempts.error = "every file action was rejected: " + "; ".join(
+                f"{r.action_type} {r.file_path} ({r.reason})" for r in validation.rejected
+            )
+        return attempts
+
+    def _build_prompt(self, understanding: IssueUnderstanding, graph: EvidenceGraph) -> str:
+        allowed = self._prompt_files(understanding, graph)
+        context = {
             "title": understanding.raw_title,
-            "intent": understanding.intent.value,
-            "evidence_nodes": [e.description for e in graph.evidence_pool[:10]],
-            "affected_symbols": [s.name for s in understanding.affected_symbols],
-            "valid_files": sorted(list(self._valid_files)) if self._valid_files else [],
+            "description": understanding.raw_description,
+            "hypotheses": [
+                {
+                    "target_symbol": h.target_symbol,
+                    "target_file": h.target_file,
+                    "proposed_action": h.proposed_action,
+                    "computed_confidence": h.computed_confidence,
+                }
+                for h in graph.hypotheses
+            ],
+            "relevant_tests": self._grounded_tests(understanding.relevant_tests),
+            "constraints": understanding.constraints,
+            "requested_actions": understanding.requested_actions,
+            "unresolved_paths": understanding.unresolved_paths,
         }
-
-        user_prompt = f"Issue & Evidence Context:\n{json.dumps(prompt_payload, indent=2)}"
-        response_text = await self._llm.generate_completion(
-            prompt=user_prompt,
-            system_prompt=self.SYSTEM_PLANNER_PROMPT,
+        omitted = len(self._valid_files) - len(allowed)
+        return "\n\n".join(
+            [
+                f"Issue and evidence:\n{json.dumps(context, indent=2)}",
+                "Repository files (MODIFY/DELETE must use one of these; CREATE must be a new "
+                "file in an existing directory):\n"
+                + "\n".join(allowed)
+                + (f"\n(... {omitted} more files not shown)" if omitted > 0 else ""),
+                f"JSON schema:\n{json.dumps(LLMPlanResponse.model_json_schema())}",
+                "Return ONLY JSON; paths outside the list are rejected.",
+            ]
         )
 
-        try:
-            parsed: dict[str, Any] = json.loads(response_text)
-            summary = parsed.get("summary", "LLM synthesized implementation plan.")
-            raw_actions = parsed.get("file_actions", [])
-            raw_tasks = parsed.get("tasks", [])
+    def _prompt_files(self, understanding: IssueUnderstanding, graph: EvidenceGraph) -> list[str]:
+        """The file list shown to the LLM: evidence-backed files first, then the rest."""
+        preferred = [f.file_path for f in understanding.affected_files]
+        preferred += [h.target_file for h in graph.hypotheses if h.target_file]
+        preferred += understanding.relevant_tests
+        ordered = dict.fromkeys(p for p in preferred if p in self._valid_files)
+        ordered.update(dict.fromkeys(sorted(self._valid_files)))
+        return list(ordered)[:MAX_PROMPT_FILES]
 
-            file_actions: list[FileAction] = []
-            for act in raw_actions:
-                act_type_str = str(act.get("action_type", "MODIFY")).upper()
-                act_type = (
-                    FileActionType.MODIFY if act_type_str == "MODIFY" else FileActionType.CREATE
-                )
-                file_actions.append(
-                    FileAction(
-                        action_type=act_type,
-                        file_path=act.get("file_path", "app/main.py"),
-                        target_symbols=act.get("target_symbols", []),
-                        description=act.get("description", ""),
-                    )
-                )
+    def _tokens_spent(self) -> int:
+        if self._llm is None:
+            return 0
+        return self._llm.total_prompt_tokens + self._llm.total_completion_tokens
 
-            tasks: list[PlanTask] = []
-            for t in raw_tasks:
-                tasks.append(
-                    PlanTask(
-                        step_number=int(t.get("step_number", 1)),
-                        title=t.get("title", "Update target code"),
-                        description=t.get("description", ""),
-                        target_file=t.get("target_file", "app/main.py"),
-                    )
-                )
-        except Exception:
-            return self._synthesize_plan_deterministically(
-                graph=graph,
-                understanding=understanding,
-                repository_id=repository_id,
-                estimated_tokens=estimated_tokens,
-            )
+    # ------------------------------------------------------------------
+    # Deterministic path
+    # ------------------------------------------------------------------
 
-        verified_actions = self._verify_and_clean_file_actions(file_actions)
-
-        return ImplementationPlan.create(
-            repository_id=repository_id,
-            summary=summary,
-            file_actions=verified_actions,
-            tasks=tasks,
-            verification_commands=self.DEFAULT_TEST_COMMANDS,
-            confidence_score=graph.overall_confidence,
-            evidence_graph_id=graph.graph_id,
-            tokens_used=estimated_tokens + 400,
-        )
-
-    def _synthesize_plan_deterministically(
-        self,
-        graph: EvidenceGraph,
-        understanding: IssueUnderstanding,
-        repository_id: uuid.UUID,
-        estimated_tokens: int,
+    def _plan_deterministically(
+        self, understanding: IssueUnderstanding, graph: EvidenceGraph, source: PlanSource
     ) -> ImplementationPlan:
-        """Deterministic plan synthesis path (0 LLM token cost, sub-15ms execution)."""
-        file_actions: list[FileAction] = []
-        tasks: list[PlanTask] = []
-        step_counter = 1
-
+        """One action per hypothesis that names a file; hypotheses without one are skipped."""
+        actions: list[FileAction] = []
+        rejected: list[RejectedAction] = []
         for hyp in graph.hypotheses:
-            target_path = hyp.target_file or self._resolve_target_file(
-                hyp.target_symbol, understanding
-            )
-            action_type = (
-                FileActionType.MODIFY if hyp.proposed_action == "MODIFY" else FileActionType.CREATE
-            )
-
-            action = FileAction(
-                action_type=action_type,
-                file_path=target_path,
-                target_symbols=[hyp.target_symbol],
-                description=f"Modify {hyp.target_symbol} to fulfill issue requirements",
-            )
-            file_actions.append(action)
-
-            tasks.append(
-                PlanTask(
-                    step_number=step_counter,
-                    title=f"Update {hyp.target_symbol}",
-                    description=f"Apply targeted implementation changes to {hyp.target_symbol}",
-                    target_file=target_path,
+            if not hyp.target_file:
+                continue
+            try:
+                action_type = FileActionType.parse(hyp.proposed_action)
+            except ValueError:
+                rejected.append(
+                    RejectedAction(hyp.target_file, hyp.proposed_action, "unknown action type")
                 )
-            )
-            step_counter += 1
-
-        if understanding.relevant_tests:
-            test_file = understanding.relevant_tests[0]
-            tasks.append(
-                PlanTask(
-                    step_number=step_counter,
-                    title="Execute test suite",
-                    description=f"Run tests in {test_file} to verify resolution",
-                    target_file=test_file,
+                continue
+            reason = action_rejection(action_type, hyp.target_file, self._valid_files, self._dirs)
+            if reason is None and any(a.file_path == hyp.target_file for a in actions):
+                reason = "duplicate action for the same file"
+            if reason is not None:
+                rejected.append(RejectedAction(hyp.target_file, action_type.value, reason))
+                continue
+            actions.append(
+                FileAction(
+                    action_type=action_type,
+                    file_path=hyp.target_file,
+                    target_symbols=[hyp.target_symbol],
+                    description=f"{action_type.value} {hyp.target_symbol} to resolve the issue",
                 )
             )
 
-        verified_actions = self._verify_and_clean_file_actions(file_actions)
-
-        summary_text = (
-            f"Evidence-driven implementation strategy for intent '{understanding.intent.value}' "
-            f"targeting {len(verified_actions)} verified file(s)."
-        )
-
+        tasks = [
+            PlanTask(
+                step_number=i,
+                title=f"{a.action_type.value.title()} {', '.join(a.target_symbols)}",
+                description=a.description,
+                target_file=a.file_path,
+            )
+            for i, a in enumerate(actions, start=1)
+        ]
         return ImplementationPlan.create(
-            repository_id=repository_id,
-            summary=summary_text,
-            file_actions=verified_actions,
+            repository_id=graph.repository_id,
+            summary=(
+                f"Evidence-driven plan for intent '{understanding.intent.value}' "
+                f"targeting {len(actions)} file(s)."
+            ),
+            file_actions=actions,
             tasks=tasks,
-            verification_commands=self.DEFAULT_TEST_COMMANDS,
-            confidence_score=graph.overall_confidence,
+            confidence_score=graph.top_confidence,
             evidence_graph_id=graph.graph_id,
-            tokens_used=estimated_tokens,
+            source=source,
+            intent=understanding.intent.value,
+            rationale=graph.routing_reason,
+            test_targets=self._merge_test_targets([], understanding),
+            rejected_actions=rejected,
         )
 
-    def _estimate_sliced_tokens(
-        self, graph: EvidenceGraph, understanding: IssueUnderstanding
-    ) -> int:
-        """Estimates context token footprint after AST slicing."""
-        base_tokens = 500
-        base_tokens += len(understanding.raw_title.split()) * 2
-        base_tokens += len(graph.evidence_pool) * 45
-        return min(2500, max(800, base_tokens))
+    # ------------------------------------------------------------------
+    # Tests
+    # ------------------------------------------------------------------
 
-    def _resolve_target_file(self, symbol_name: str, understanding: IssueUnderstanding) -> str:
-        for f in understanding.affected_files:
-            if "/" in f.file_path or ".py" in f.file_path:
-                return f.file_path
-        return f"app/{symbol_name.lower().replace('.', '_')}.py"
+    def _grounded_tests(self, paths: list[str]) -> list[str]:
+        return [p for p in paths if p in self._valid_files and is_test_path(p)]
 
-    def _verify_and_clean_file_actions(self, actions: list[FileAction]) -> list[FileAction]:
-        """
-        Anti-Hallucination Gate: Ensures all target file paths exist in the valid repository tree.
-        """
-        if not self._valid_files:
-            return actions
+    def _merge_test_targets(
+        self, validated: list[str], understanding: IssueUnderstanding
+    ) -> list[str]:
+        """Validated LLM targets plus grounded issue tests, deduplicated in order."""
+        return list(dict.fromkeys(validated + self._grounded_tests(understanding.relevant_tests)))
 
-        verified: list[FileAction] = []
-        for act in actions:
-            clean_path = act.file_path.replace("\\", "/").strip()
-            if clean_path in self._valid_files:
-                verified.append(act)
-            else:
-                best_match = self._find_closest_valid_file(clean_path)
-                if best_match:
-                    verified.append(
-                        FileAction(
-                            action_type=act.action_type,
-                            file_path=best_match,
-                            target_symbols=act.target_symbols,
-                            start_line=act.start_line,
-                            end_line=act.end_line,
-                            description=f"{act.description} (Auto-corrected from {clean_path})",
-                        )
-                    )
-        return verified or actions
 
-    def _find_closest_valid_file(self, target: str) -> str | None:
-        target_stem = target.split("/")[-1].lower().split(".")[0]
-        for vf in sorted(self._valid_files):
-            vf_stem = vf.split("/")[-1].lower().split(".")[0]
-            if vf_stem in target_stem or target_stem in vf_stem:
-                return vf
-        return sorted(list(self._valid_files))[0] if self._valid_files else None
+def _with_retry_note(prompt: str, error: str) -> str:
+    if not error:
+        return prompt
+    return (
+        f"{prompt}\n\nYour previous reply was rejected: {error}\n"
+        "Fix it and return ONLY the corrected JSON object."
+    )

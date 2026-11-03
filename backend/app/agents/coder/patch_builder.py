@@ -3,14 +3,56 @@ Phase 9A: Patch Builder & Surgical AST Replacement Engine
 """
 
 import ast
+import logging
 import textwrap
+from collections.abc import Iterable
 from pathlib import Path
 
 from app.agents.coder.models import CodePatch, SymbolAction, SymbolTarget
+from app.agents.coder.paths import UnsafePathError, resolve_in_repo
+
+logger = logging.getLogger(__name__)
 
 
 class PatchApplicationError(Exception):
     """Raised when patch application fails due to hash mismatch or missing file."""
+
+
+class _FileSnapshot:
+    """Pre-patch file contents and missing directories, so a failed apply can be undone."""
+
+    def __init__(self, contents: dict[Path, bytes | None], missing_dirs: list[Path]) -> None:
+        self._contents = contents
+        self._missing_dirs = missing_dirs
+
+    @classmethod
+    def capture(cls, paths: Iterable[Path], root: Path) -> "_FileSnapshot":
+        contents: dict[Path, bytes | None] = {}
+        missing_dirs: set[Path] = set()
+        for path in paths:
+            contents[path] = path.read_bytes() if path.exists() else None
+            parent = path.parent
+            while parent != root and not parent.exists():
+                missing_dirs.add(parent)
+                parent = parent.parent
+        # Deepest first, so rmdir sees children removed before parents.
+        return cls(contents, sorted(missing_dirs, key=lambda d: len(d.parts), reverse=True))
+
+    def restore(self) -> None:
+        """Best-effort: each step is independent so one failure cannot skip the rest."""
+        for path, content in self._contents.items():
+            try:
+                if content is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    path.write_bytes(content)
+            except OSError as e:
+                logger.error(f"Could not restore {path} after failed patch: {e}")
+        for directory in self._missing_dirs:
+            try:
+                directory.rmdir()
+            except OSError:
+                pass  # not empty or already gone
 
 
 class PatchBuilder:
@@ -319,12 +361,39 @@ class PatchBuilder:
         raise PatchApplicationError(f"Could not find symbol '{symbol_name}' to DELETE.")
 
     def apply_patch(self, patch: CodePatch, verify_hash: bool = False) -> list[str]:
-        """Applies CodePatch hunks surgically to target files and returns modified file paths."""
+        """Applies all hunks or none, returning the modified repo-relative paths.
+
+        Every target path is checked to stay inside the repository before anything is
+        written; if any hunk fails, every touched file is restored to its prior state.
+        """
+        resolved = {
+            hunk.target_symbol.file_path: self._resolve(hunk.target_symbol.file_path)
+            for hunk in patch.hunks
+        }
+        snapshot = _FileSnapshot.capture(resolved.values(), self.repo_root)
+        try:
+            return self._apply_hunks(patch, resolved, verify_hash)
+        except Exception:
+            snapshot.restore()
+            raise
+
+    def _resolve(self, rel_path: str) -> Path:
+        try:
+            path = resolve_in_repo(self.repo_root, rel_path)
+        except UnsafePathError as e:
+            raise PatchApplicationError(str(e)) from e
+        if path.exists() and not path.is_file():
+            raise PatchApplicationError(f"Patch target is not a regular file: {rel_path}")
+        return path
+
+    def _apply_hunks(
+        self, patch: CodePatch, resolved: dict[str, Path], verify_hash: bool
+    ) -> list[str]:
         modified_files: list[str] = []
 
         for hunk in patch.hunks:
             target = hunk.target_symbol
-            file_path = self.repo_root / target.file_path
+            file_path = resolved[target.file_path]
 
             if hunk.action == SymbolAction.REPLACE_FILE:
                 file_path.parent.mkdir(parents=True, exist_ok=True)

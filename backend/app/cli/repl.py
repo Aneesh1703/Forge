@@ -18,14 +18,16 @@ from prompt_toolkit.styles import Style
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Prompt
+from rich.prompt import Confirm, Prompt
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
 
 from app.agents.coder.models import ExecutionPolicy
+from app.cli.command_parser import InputKind, parse_input
 from app.cli.config import ConfigManager
+from app.cli.ui import TerminalUI
 from app.github.auth import GitHubAuthManager
 from app.orchestration.pipeline import ForgeOrchestrator
 from app.orchestration.state import JobState, JobStatus
@@ -56,6 +58,7 @@ SLASH_COMMANDS = [
     "/fix",
     "/plan",
     "/approve",
+    "/publish",
     "/reject",
     "/diff",
     "/jobs",
@@ -66,6 +69,10 @@ SLASH_COMMANDS = [
     "/exit",
     "/quit",
 ]
+
+GATE_STATUSES = frozenset(
+    {JobStatus.AWAITING_GATE_1, JobStatus.AWAITING_GATE_2, JobStatus.AWAITING_GATE_3}
+)
 
 
 class ForgeREPL:
@@ -166,15 +173,16 @@ class ForgeREPL:
         commands = [
             ("/help", "Show this help message", "help"),
             ("/status", "Show current job status", "status"),
-            ("/fix <issue>", "Run full pipeline on an issue", "fix"),
-            ("/plan <issue>", "Preview implementation plan only", "plan"),
-            ("/approve", "Approve current pending gate", "approve"),
-            ("/reject", "Reject current pending gate", "reject"),
-            ("/diff", "Show current patch details", "diff"),
+            ("/fix <issue>", "Run full pipeline on an issue", ""),
+            ("/plan <issue>", "Preview implementation plan only", ""),
+            ("/approve", "Approve pending gate (commits locally, no push)", "a*"),
+            ("/publish", "Approve, commit, push & open a PR", "p*"),
+            ("/reject", "Reject current pending gate", "r*"),
+            ("/diff", "Show current patch details", "diff, d*"),
             ("/jobs", "List all jobs for current repo", "jobs"),
-            ("/config", "Show configured API keys", "config"),
-            ("/policy <mode>", "Set policy (MANUAL / SEMI / AUTO)", "policy"),
-            ("/rewind [steps]", "Rewind state machine history", "rewind"),
+            ("/config", "Show configured API keys", ""),
+            ("/policy <mode>", "Set policy (MANUAL / SEMI / AUTO)", ""),
+            ("/rewind [steps]", "Rewind state machine history", ""),
             ("/clear", "Clear terminal screen", "clear"),
             ("/exit", "Exit Forge shell", "quit/exit"),
         ]
@@ -182,7 +190,10 @@ class ForgeREPL:
             table.add_row(cmd, desc, sc)
 
         console.print(table)
-        console.print()
+        console.print(
+            "[dim]   * single-letter shortcuts work only while a job is paused at a gate. "
+            "Any other text asks before starting a new fix job.[/dim]\n"
+        )
 
     def run_onboarding(self) -> bool:
         """Interactive, stylized onboarding: collect repo, issue, and branch."""
@@ -204,23 +215,19 @@ class ForgeREPL:
             except (KeyboardInterrupt, EOFError):
                 return False
 
-            if repo_input.startswith("/"):
-                if repo_input == "/help":
-                    self.print_help()
-                # If valid default path exists, fallback to default_repo
-                if Path(default_repo).exists():
-                    repo_path = Path(default_repo).resolve()
+            if repo_input == "/help":
+                self.print_help()
+                continue
+
+            # Absolute paths (/Users/me/proj) are paths, not slash commands.
+            try:
+                repo_path = Path(repo_input or default_repo).expanduser().resolve()
+                if repo_path.is_dir():
                     break
-
-            repo_path = Path(repo_input).resolve()
-            if repo_path.exists():
-                break
-
-            console.print(f"[warning]   ⚠️ Directory not found: {repo_path}.[/warning]")
-            console.print(f"[info]   Using default repository: {default_repo}[/info]")
-            if Path(default_repo).exists():
-                repo_path = Path(default_repo).resolve()
-                break
+                problem = f"Not a directory: {repo_path}"
+            except (OSError, RuntimeError, ValueError) as e:  # ~nouser, NUL byte, no access
+                problem = f"Invalid path {repo_input!r}: {e}"
+            console.print(f"[warning]   ⚠️ {problem}. Please try again.[/warning]")
 
         self.repo_path = repo_path
 
@@ -267,41 +274,18 @@ class ForgeREPL:
 
     def handle_command(self, raw_input: str) -> bool:
         """Routes a slash command or natural language input. Returns False to exit."""
-        text = raw_input.strip()
-        if not text:
+        parsed = parse_input(raw_input, gate_pending=self._gate_pending())
+        if parsed.kind == InputKind.EMPTY:
+            return True
+        if parsed.kind == InputKind.ISSUE:
+            # Free text starts a paid LLM job, so confirm unless /fix was used explicitly.
+            if self._confirm(f"Start a new fix job for: [info]{parsed.arg[:80]}[/info]?"):
+                self._cmd_fix(parsed.arg)
+            else:
+                console.print("[dim]   Not started. Use /fix <issue> or /help.[/dim]\n")
             return True
 
-        parts = text.split(maxsplit=1)
-        cmd_candidate = parts[0].lower()
-        arg = parts[1] if len(parts) > 1 else ""
-
-        keyword_map: dict[str, str] = {
-            "approve": "/approve",
-            "reject": "/reject",
-            "publish": "/publish",
-            "status": "/status",
-            "help": "/help",
-            "quit": "/quit",
-            "exit": "/exit",
-            "diff": "/diff",
-            "jobs": "/jobs",
-            "config": "/config",
-            "rewind": "/rewind",
-            "clear": "/clear",
-            "a": "/approve",
-            "d": "/diff",
-            "p": "/publish",
-            "r": "/reject",
-        }
-
-        if cmd_candidate in keyword_map:
-            cmd = keyword_map[cmd_candidate]
-        elif cmd_candidate.startswith("/"):
-            cmd = cmd_candidate
-        else:
-            self._cmd_fix(text)
-            return True
-
+        cmd, arg = parsed.command, parsed.arg
         if cmd in ("/exit", "/quit"):
             return False
         elif cmd == "/help":
@@ -335,6 +319,25 @@ class ForgeREPL:
             console.print(f"[warning]⚠️ Unknown command: {cmd}. Type /help[/warning]\n")
 
         return True
+
+    def _current_status(self) -> JobStatus | None:
+        if not self.current_job_id or not self.orchestrator:
+            return None
+        try:
+            return JobState.load(self.orchestrator.get_state_path(self.current_job_id)).status
+        except Exception:
+            return None
+
+    def _gate_pending(self) -> bool:
+        """True while the current job is paused at a human gate."""
+        return self._current_status() in GATE_STATUSES
+
+    @staticmethod
+    def _confirm(question: str) -> bool:
+        try:
+            return Confirm.ask(f"   {question}", default=False, console=console)
+        except (KeyboardInterrupt, EOFError):
+            return False
 
     def _cmd_fix(self, issue: str) -> None:
         """Runs the full Forge pipeline on an issue with rich visual feedback.
@@ -374,7 +377,10 @@ class ForgeREPL:
         self._render_job_result(final)
 
     def _cmd_plan(self, issue: str) -> None:
-        """Generates and displays an implementation plan without executing."""
+        """Runs understand → investigate → plan and stops at Gate 1, whatever the policy.
+
+        The job stays open: /approve continues it under the current policy, /reject drops it.
+        """
         if not self.orchestrator or not self.repo_path:
             console.print("[danger]❌ No repository set.[/danger]\n")
             return
@@ -382,22 +388,25 @@ class ForgeREPL:
             console.print("[warning]⚠️ Please provide an issue description.[/warning]\n")
             return
 
-        with console.status(
-            "[bold cyan]Drafting implementation plan...[/bold cyan]", spinner="dots"
-        ):
-            tf = self._detect_target_file(issue)
+        self.issue_prompt = issue
+        state = self.orchestrator.create_job(issue_prompt=issue, execution_policy=self.policy)
+        self.current_job_id = state.job_id
 
-        console.print(
-            Panel(
-                f"[bold]Target File:[/bold] [info]{tf}[/info]\n"
-                f"[bold]Policy:[/bold]      [info]{self.policy.value}[/info]\n"
-                f"[bold]Goal:[/bold]        [white]{issue}[/white]",
-                title="🗺️ [bold green]Implementation Plan Preview[/bold green]",
-                border_style="green",
-                box=box.ROUNDED,
-            )
-        )
-        console.print()
+        async def _run() -> JobState:
+            assert self.orchestrator is not None
+            return await self.orchestrator.execute_job(job_id=state.job_id, plan_only=True)
+
+        with console.status(
+            "[bold cyan]Understanding the issue and drafting a plan...[/bold cyan]",
+            spinner="dots",
+        ):
+            try:
+                final = asyncio.run(_run())
+            except Exception as e:
+                console.print(f"\n[danger]❌ Planning error: {e}[/danger]\n")
+                return
+
+        self._render_job_result(final)
 
     def _cmd_status(self) -> None:
         """Shows current job status."""
@@ -456,16 +465,29 @@ class ForgeREPL:
                 gate_3_approved=True,
             )
 
-        with console.status("[bold green]Approving gates and resuming...[/bold green]"):
+        with console.status("[bold green]Approving gate and resuming...[/bold green]"):
             result = asyncio.run(_run())
 
-        console.print(f"[success]✅ Approved! Status is now {result.status.value}[/success]\n")
+        console.print(f"[success]✅ Approved! Status is now {result.status.value}[/success]")
+        if result.commit_sha and not result.pr_url:
+            console.print(
+                f"[dim]   Committed locally on {result.git_branch} — nothing was pushed. "
+                "Use /publish to push and open a PR.[/dim]"
+            )
+        console.print()
         self._render_job_result(result)
 
     def _cmd_publish(self) -> None:
         """Publishes the active job patch directly to GitHub as a Pull Request."""
         if not self.current_job_id or not self.orchestrator:
             console.print("[dim]ℹ️ No active job to publish.[/dim]\n")
+            return
+
+        if self._current_status() == JobStatus.AWAITING_GATE_1:
+            console.print(
+                "[warning]⚠️ Nothing to publish yet — the plan is awaiting approval. "
+                "Use /approve to continue.[/warning]\n"
+            )
             return
 
         if not GitHubAuthManager.is_authenticated():
@@ -517,7 +539,10 @@ class ForgeREPL:
                 )
             )
         else:
-            console.print(f"[success]✅ Job processed. Status: {result.status.value}[/success]\n")
+            console.print(f"[success]✅ Job processed. Status: {result.status.value}[/success]")
+            if result.error_message:
+                console.print(f"   [warning]⚠️ {result.error_message}[/warning]")
+            console.print()
 
     def _cmd_reject(self) -> None:
         if not self.current_job_id or not self.orchestrator:
@@ -554,9 +579,15 @@ class ForgeREPL:
             console.print("[warning]⚠️ No patch generated yet for this job.[/warning]\n")
             return
 
-        # 1. Attempt to render physical git diff from working tree as source of truth
+        # 1. Render the real git diff: the job's commit once committed (the user is
+        #    returned to their original branch), otherwise the working tree.
         if self.orchestrator and hasattr(self.orchestrator, "git_service"):
-            git_diff = self.orchestrator.git_service.get_working_tree_diff()
+            git_service = self.orchestrator.git_service
+            git_diff = (
+                git_service.show_commit(state.commit_sha)
+                if state.commit_sha
+                else git_service.get_working_tree_diff()
+            )
             if git_diff and git_diff.strip():
                 syntax = Syntax(git_diff, "diff", theme="monokai", line_numbers=True)
                 console.print(
@@ -843,8 +874,33 @@ class ForgeREPL:
 
         return "app.py"
 
+    def _render_plan(self, state: JobState) -> None:
+        """Shows the plan awaiting Gate 1 approval and where its files were written."""
+        if not state.implementation_plan or not self.orchestrator:
+            return
+        plan_path = self.orchestrator.get_artifact_dir(state.job_id) / "plan.md"
+        console.print(
+            TerminalUI.plan_panel(
+                state.implementation_plan, plan_path if plan_path.exists() else None
+            )
+        )
+
     def _render_interactive_gate_prompt(self, state: JobState) -> None:
         """Renders interactive gate action menu."""
+        if state.status == JobStatus.AWAITING_GATE_1:
+            console.print(
+                Panel(
+                    "[bold white]Review the plan above — select an action:[/bold white]\n\n"
+                    "   [bold cyan][A][/bold cyan] ✅ [bold white]Approve Plan[/bold white]\n"
+                    "        — Start coding within this plan (/approve or 'a')\n"
+                    "   [bold cyan][R][/bold cyan] ❌ [bold white]Reject Plan[/bold white]\n"
+                    "        — Abort the job before any code is written (/reject or 'r')",
+                    title="🛡️ [bold yellow]Gate 1 — Plan Approval[/bold yellow]",
+                    border_style="yellow",
+                    box=box.ROUNDED,
+                )
+            )
+            return
         menu = (
             "[bold white]Human-in-the-Loop Checkpoint — Select an action:[/bold white]\n\n"
             "   [bold cyan][A][/bold cyan] ✅ [bold white]Approve & Commit[/bold white]\n"
@@ -872,6 +928,8 @@ class ForgeREPL:
                 f"\n🎉 [bold success]Pipeline Finished Successfully![/bold success] "
                 f"({state.status.value})"
             )
+            if state.error_message:
+                console.print(f"   [warning]⚠️ {state.error_message}[/warning]")
             if state.pr_url:
                 commit_str = state.commit_sha[:8] if state.commit_sha else "N/A"
                 branch_str = state.git_branch or "N/A"
@@ -885,8 +943,13 @@ class ForgeREPL:
                         box=box.ROUNDED,
                     )
                 )
-            elif self.policy != ExecutionPolicy.AUTONOMOUS:
-                self._render_interactive_gate_prompt(state)
+            elif state.commit_sha:
+                # Already committed: no gate is pending, so only /publish applies.
+                console.print(
+                    f"   🌿 Committed locally on [info]{state.git_branch}[/info] "
+                    f"({state.commit_sha[:8]}). Use [bold]/publish[/bold] to push and open "
+                    "a PR, or /diff to review."
+                )
         elif state.status in (
             JobStatus.AWAITING_GATE_1,
             JobStatus.AWAITING_GATE_2,
@@ -896,6 +959,11 @@ class ForgeREPL:
                 f"\n⚠️ [bold yellow]Pipeline Paused at Gate Checkpoint:[/bold yellow] "
                 f"{state.status.value}"
             )
+            if state.status == JobStatus.AWAITING_GATE_1:
+                self._render_plan(state)
+            if state.status == JobStatus.AWAITING_GATE_2:
+                for reason in state.gate_2_reasons:
+                    console.print(f"   [warning]• {reason}[/warning]")
             self._render_interactive_gate_prompt(state)
         else:
             console.print(f"\n⚠️ [bold warning]Pipeline Halted:[/bold warning] {state.status.value}")
